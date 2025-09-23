@@ -1,3 +1,11 @@
+use chumsky::Parser;
+
+mod lexer;
+
 fn main() {
-    println!("Hello, world!");
+    let query = "CREATE DATABASE ;";
+    let result = lexer::parser().parse(query);
+    assert!(result.has_errors());
+    let errors = result.errors();
+    errors.for_each(|e| println!("{}", e));
 }
