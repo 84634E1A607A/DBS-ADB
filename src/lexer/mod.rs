@@ -1,54 +1,7 @@
-use chumsky::{input::Emitter, prelude::*, text::ascii::ident};
+use std::ptr::null;
 
-// // Define Keywords
-// #[derive(Debug, Clone, PartialEq)]
-// pub enum Keyword {
-//     // COUNT
-//     Count,
+use chumsky::{input::Emitter, prelude::*, text::ascii::ident, regex::regex};
 
-//     // AVG
-//     Average,
-
-//     // MAX
-//     Max,
-
-//     // MIN
-//     Min,
-
-//     // SUM
-//     Sum,
-
-//     // NULL
-//     Null,
-
-//     // CREATE
-//     Create,
-
-//     // DROP
-//     Drop,
-
-//     // SHOW
-//     Show,
-
-//     // USE
-//     Use,
-
-//     // DATABASE
-//     Database,
-
-//     // TABLE
-//     Table,
-
-//     // INDEXES
-//     Indexes,
-
-//     // DESC
-//     Describe,
-
-//     // LOAD DATA INFILE
-//     Load,
-
-// }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DBStatement {
@@ -389,17 +342,27 @@ pub fn parser<'a>() -> impl Parser<'a, &'a str, Vec<Query>, extra::Err<Rich<'a, 
         ))
     }
 
+    fn annotation<'a>() -> impl Parser<'a, &'a str, Query, extra::Err<Rich<'a, char>>> {
+        just("--").ignore_then(none_of(";").repeated()).to_slice().map(|s: &str| {
+            Query::Annotation(s.trim().to_string())
+        })
+    }
+
+    fn null_statement<'a>() -> impl Parser<'a, &'a str, Query, extra::Err<Rich<'a, char>>> {
+        just("").to(Query::Null)
+    }
+
     choice((
         db_statement().map(Query::DBStmt),
         alter_statement().map(Query::AlterStmt),
-    ))
-    .separated_by(just(';').padded()).allow_trailing().collect()
+        annotation(),
+        null_statement(),
+    )).then_ignore(just(';')).padded()
+        .repeated().collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::result;
-
     use super::*;
 
     #[test]
@@ -508,5 +471,37 @@ mod tests {
 
         let result = parser().parse(query);
         assert!(result.has_errors());
+    }
+
+    #[test]
+    fn test_annotation() {
+        let query = "-- Leading Annotation;
+CREATE DATABASE test_db; -- Trailing Annotation
+-- Annotation ends here; DROP DATABASE test_db;;;;
+        ";
+
+        let result = parser().parse(query);
+
+        result.errors().map(|e| println!("Error: {:?}", e)).count();
+
+        assert!(!result.has_errors());
+        let queries = result.unwrap();
+        assert_eq!(queries.len(), 7);
+        assert_eq!(
+            queries[0],
+            Query::Annotation("-- Leading Annotation".into())
+        );
+        assert_eq!(
+            queries[1],
+            Query::DBStmt(DBStatement::CreateDatabase("test_db".into()))
+        );
+        assert_eq!(
+            queries[2],
+            Query::Annotation("-- Trailing Annotation\n-- Annotation ends here".into())
+        );
+        assert_eq!(
+            queries[3],
+            Query::DBStmt(DBStatement::DropDatabase("test_db".into()))
+        );
     }
 }
