@@ -1,5 +1,3 @@
-use chumsky::Parser;
-
 mod lexer_parser;
 
 fn main() {

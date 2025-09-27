@@ -26,6 +26,10 @@ pub fn parse<'a>(input: &'a str) -> Result<Vec<Query>, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::{result, vec};
+
+    use crate::lexer_parser::parser::{SelectClause, TableColumn, WhereClause};
+
     use super::*;
     use chumsky::Parser;
 
@@ -173,14 +177,171 @@ CREATE DATABASE test_db; -- Trailing Annotation
         let result = parse(query);
         dbg!(&result);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), vec![
-            Query::Annotation("-- Leading Annotation".into()),
-            Query::DBStmt(DBStatement::CreateDatabase("test_db".into())),
-            Query::Annotation("-- Trailing Annotation\n-- Annotation ends here".into()),
-            Query::DBStmt(DBStatement::DropDatabase("test_db".into())),
-            Query::Null,
-            Query::Null,
-            Query::Null,
-        ]);
+        assert_eq!(
+            result.unwrap(),
+            vec![
+                Query::Annotation("-- Leading Annotation".into()),
+                Query::DBStmt(DBStatement::CreateDatabase("test_db".into())),
+                Query::Annotation("-- Trailing Annotation\n-- Annotation ends here".into()),
+                Query::DBStmt(DBStatement::DropDatabase("test_db".into())),
+                Query::Null,
+                Query::Null,
+                Query::Null,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_table_stmt_misc() {
+        let query = "
+        DROP TABLE my_table;
+        DESC my_table;
+        INSERT INTO my_table VALUES (1, 'value');
+        LOAD DATA INFILE 'data.txt' INTO TABLE my_table FIELDS TERMINATED BY ',';
+        ";
+
+        let result = parse(query);
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            vec![
+                Query::TableStmt(parser::TableStatement::DropTable("my_table".into())),
+                Query::TableStmt(parser::TableStatement::DescribeTable("my_table".into())),
+                Query::TableStmt(parser::TableStatement::InsertInto(
+                    "my_table".into(),
+                    vec![vec![
+                        parser::Value::Integer(1),
+                        parser::Value::String("value".into())
+                    ]]
+                )),
+                Query::TableStmt(parser::TableStatement::LoadDataInfile(
+                    "data.txt".into(),
+                    "my_table".into(),
+                    ','
+                ))
+            ]
+        );
+    }
+
+    #[test]
+    fn test_table_stmt_where() {
+        let query = "
+        DELETE FROM my_table WHERE col1 = 1 AND col2 = 'value';
+        UPDATE my_table SET col1 = 2, col2 = 'new_value' WHERE col2 = col3;
+        ";
+
+        let result = parse(query);
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            vec![
+                Query::TableStmt(parser::TableStatement::DeleteFrom(
+                    "my_table".into(),
+                    Some(vec![
+                        WhereClause::Op(
+                            TableColumn {
+                                table: None,
+                                column: "col1".into()
+                            },
+                            parser::Operator::Eq,
+                            parser::Expression::Value(parser::Value::Integer(1))
+                        ),
+                        WhereClause::Op(
+                            TableColumn {
+                                table: None,
+                                column: "col2".into()
+                            },
+                            parser::Operator::Eq,
+                            parser::Expression::Value(parser::Value::String("value".into()))
+                        )
+                    ])
+                )),
+                Query::TableStmt(parser::TableStatement::Update(
+                    "my_table".into(),
+                    vec![
+                        ("col1".into(), parser::Value::Integer(2)),
+                        ("col2".into(), parser::Value::String("new_value".into())),
+                    ],
+                    Some(vec![WhereClause::Op(
+                        TableColumn {
+                            table: None,
+                            column: "col2".into()
+                        },
+                        parser::Operator::Eq,
+                        parser::Expression::Column(TableColumn {
+                            table: None,
+                            column: "col3".into()
+                        })
+                    )])
+                ))
+            ]
+        )
+    }
+
+    #[test]
+    fn test_table_stmt_select() {
+        let query = "
+        SELECT * FROM my_table;
+        SELECT col1, col2 FROM my_table WHERE col3 IN (10, 20, 30) ORDER BY col1 DESC LIMIT 5 OFFSET 10;
+        ";
+
+        let result = parse(query);
+        dbg!(&result);
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            vec![
+                Query::TableStmt(parser::TableStatement::Select(SelectClause {
+                    table: vec!["my_table".into()],
+                    where_clauses: vec![],
+                    selectors: parser::Selectors::All,
+                    limit: None,
+                    offset: None,
+                    order_by: None,
+                    group_by: None
+                })),
+                Query::TableStmt(parser::TableStatement::Select(SelectClause {
+                    table: vec!["my_table".into()],
+                    where_clauses: vec![WhereClause::In(
+                        TableColumn {
+                            table: None,
+                            column: "col3".into()
+                        },
+                        vec![
+                            parser::Value::Integer(10),
+                            parser::Value::Integer(20),
+                            parser::Value::Integer(30)
+                        ]
+                    )],
+                    selectors: parser::Selectors::List(vec![
+                        parser::Selector::Column(TableColumn {
+                            table: None,
+                            column: "col1".into()
+                        }),
+                        parser::Selector::Column(TableColumn {
+                            table: None,
+                            column: "col2".into()
+                        })
+                    ]),
+                    limit: Some(5),
+                    offset: Some(10),
+                    order_by: Some((
+                        TableColumn {
+                            table: None,
+                            column: "col1".into()
+                        },
+                        false
+                    )),
+                    group_by: None
+                }))
+            ]
+        )
+    }
+
+    #[test]
+    fn test_load_table_delimiter() {
+        let query = "LOAD DATA INFILE 'data.txt' INTO TABLE my_table FIELDS TERMINATED BY 'abc';";
+        let result = parse(query);
+        assert!(result.is_err());
     }
 }
