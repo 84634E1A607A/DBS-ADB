@@ -9,6 +9,7 @@ pub enum KeywordEnum {
     Show,
     Use,
     Tables,
+    Index,
     Indexes,
     Table,
     Alter,
@@ -80,7 +81,7 @@ pub fn lexer<'a>() -> impl Parser<'a, &'a str, Vec<SQLToken<'a>>, extra::Err<Ric
 
     let keyword = {
         // Use a regex with word boundaries so keywords aren't matched as prefixes of identifiers
-        let pattern = r"\b(?:CREATE|DATABASE|DATABASES|DROP|SHOW|USE|TABLES|INDEXES|TABLE|ALTER|ADD|PRIMARY|KEY|FOREIGN|REFERENCES|INFILE|INTO|FIELDS|TERMINATED|BY|VALUES|INSERT|DELETE|FROM|UPDATE|SET|WHERE|SELECT|COUNT|AVG|MAX|MIN|SUM|GROUP|ORDER|LIMIT|OFFSET|ASC|DESC|NULL|NOT|LIKE)\b";
+        let pattern = r"\b(?:CREATE|DATABASE|DATABASES|DROP|SHOW|USE|TABLES|INDEX|INDEXES|TABLE|ALTER|ADD|PRIMARY|KEY|FOREIGN|REFERENCES|INFILE|INTO|FIELDS|TERMINATED|BY|VALUES|INSERT|DELETE|FROM|UPDATE|SET|WHERE|SELECT|COUNT|AVG|MAX|MIN|SUM|GROUP|ORDER|LIMIT|OFFSET|ASC|DESC|NULL|NOT|LIKE)\b";
         regex(pattern).map(|s: &str| SQLToken::Keyword(match s {
             "CREATE" => KeywordEnum::Create,
             "DATABASE" => KeywordEnum::Database,
@@ -89,6 +90,7 @@ pub fn lexer<'a>() -> impl Parser<'a, &'a str, Vec<SQLToken<'a>>, extra::Err<Ric
             "SHOW" => KeywordEnum::Show,
             "USE" => KeywordEnum::Use,
             "TABLES" => KeywordEnum::Tables,
+            "INDEX" => KeywordEnum::Index,
             "INDEXES" => KeywordEnum::Indexes,
             "TABLE" => KeywordEnum::Table,
             "ALTER" => KeywordEnum::Alter,

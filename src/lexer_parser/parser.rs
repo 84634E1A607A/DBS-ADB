@@ -1,6 +1,6 @@
 use chumsky::{input::Emitter, prelude::*, text::ascii::ident};
 
-use crate::lexer_parser::{SQLToken as T, KeywordEnum as K};
+use crate::lexer_parser::{KeywordEnum as K, SQLToken as T};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DBStatement {
@@ -195,6 +195,7 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
             show_tables,
             show_indexes,
         ))
+        .boxed()
     }
 
     fn alter_statement<'a>()
@@ -202,13 +203,15 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
         // ALTER TABLE Identifier
         let alter_table = just(T::Keyword(K::Alter))
             .ignore_then(just(T::Keyword(K::Table)))
-            .ignore_then(identifier()).boxed();
+            .ignore_then(identifier())
+            .boxed();
 
-        let add_index = alter_table.clone()
+        let add_index = alter_table
+            .clone()
             // ADD INDEX Identifier?
             .then(
                 just(T::Keyword(K::Add))
-                    .ignore_then(just(T::Keyword(K::Indexes)))
+                    .ignore_then(just(T::Keyword(K::Index)))
                     .ignore_then(identifier().or_not()),
             )
             // ( field_list )
@@ -229,30 +232,33 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
                 },
             );
 
-        let drop_index = alter_table.clone()
+        let drop_index = alter_table
+            .clone()
             // DROP INDEX Identifier
             .then(
                 just(T::Keyword(K::Drop))
-                    .ignore_then(just(T::Keyword(K::Indexes)))
+                    .ignore_then(just(T::Keyword(K::Index)))
                     .ignore_then(identifier()),
             )
             .map(|(table_ident, index_name): (&str, &str)| {
                 AlterStatement::DropIndex(table_ident.into(), index_name.into())
             });
 
-        let drop_pkey = alter_table.clone()
+        let drop_pkey = alter_table
+            .clone()
             // DROP PRIMARY KEY
             .then(
                 just(T::Keyword(K::Drop))
                     .ignore_then(just(T::Keyword(K::Primary)))
                     .ignore_then(just(T::Keyword(K::Key)))
-                    .ignore_then(identifier()).or_not(),
+                    .ignore_then(identifier().or_not()),
             )
             .map(|(table_ident, pkey_name): (&str, Option<&str>)| {
                 AlterStatement::DropPKey(table_ident.into(), pkey_name.map(|s| s.into()))
             });
 
-        let drop_fkey = alter_table.clone()
+        let drop_fkey = alter_table
+            .clone()
             // DROP FOREIGN KEY Identifier
             .then(
                 just(T::Keyword(K::Drop))
@@ -264,7 +270,8 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
                 AlterStatement::DropFKey(table_ident.into(), fkey_name.into())
             });
 
-        let add_pkey = alter_table.clone()
+        let add_pkey = alter_table
+            .clone()
             // ADD PRIMARY KEY
             .then(
                 just(T::Keyword(K::Add))
@@ -276,7 +283,8 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
                             .separated_by(just(T::Symbol(',')))
                             .collect()
                             .delimited_by(just(T::Symbol('(')), just(T::Symbol(')'))),
-                    ).boxed(),
+                    )
+                    .boxed(),
             )
             .map(|(table_ident, fields): (&str, Vec<&str>)| {
                 AlterStatement::AddPKey(
@@ -298,26 +306,30 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
                 identifier()
                     .separated_by(just(T::Symbol(',')))
                     .collect()
-                    .delimited_by(just(T::Symbol('(')), just(T::Symbol(')'))),
+                    .delimited_by(just(T::Symbol('(')), just(T::Symbol(')')))
+                    .boxed(),
             )
             // REFERENCES Identifier
-            .then(
-                just(T::Keyword(K::References))
-                    .ignore_then(identifier()),
-            )
+            .then(just(T::Keyword(K::References)).ignore_then(identifier()))
             // ( field_list )
             .then(
                 identifier()
                     .separated_by(just(T::Symbol(',')))
                     .collect()
-                    .delimited_by(just(T::Symbol('(')), just(T::Symbol(')'))),
+                    .delimited_by(just(T::Symbol('(')), just(T::Symbol(')')))
+                    .boxed(),
             )
-            .validate(|((((table_ident, fkey_name), fields), ref_table), ref_fields): ((((&str, Option<&str>), Vec<&str>), &str), Vec<&str>),
-                _map, emitter: &mut Emitter<Rich<T<'a>>>| {
-                // Check that the number of fields matches the number of reference fields
-                if fields.len() != ref_fields.len() {
-                    // Return a chumsky parse error instead of panicking
-                    emitter.emit(Rich::custom(
+            .validate(
+                |((((table_ident, fkey_name), fields), ref_table), ref_fields): (
+                    (((&str, Option<&str>), Vec<&str>), &str),
+                    Vec<&str>,
+                ),
+                 _map,
+                 emitter: &mut Emitter<Rich<T<'a>>>| {
+                    // Check that the number of fields matches the number of reference fields
+                    if fields.len() != ref_fields.len() {
+                        // Return a chumsky parse error instead of panicking
+                        emitter.emit(Rich::custom(
                         _map.span(),
                         format!(
                             "number of fields ({}) does not match number of reference fields ({})",
@@ -325,31 +337,31 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
                             ref_fields.len()
                         ),
                     ))
-                }
+                    }
 
-                AlterStatement::AddFKey(
-                    table_ident.into(),
-                    fkey_name.map(|s| s.into()),
-                    fields.into_iter().map(|s| s.into()).collect(),
-                    ref_table.into(),
-                    ref_fields.into_iter().map(|s| s.into()).collect(),
-                )
-            });
+                    AlterStatement::AddFKey(
+                        table_ident.into(),
+                        fkey_name.map(|s| s.into()),
+                        fields.into_iter().map(|s| s.into()).collect(),
+                        ref_table.into(),
+                        ref_fields.into_iter().map(|s| s.into()).collect(),
+                    )
+                },
+            );
 
         choice((
             add_index, drop_index, drop_pkey, drop_fkey, add_pkey, add_fkey,
         ))
+        .boxed()
     }
 
-    // fn annotation<'a>() -> impl Parser<'a, &'a str, Query, extra::Err<Rich<'a, char>>> {
-    //     just("--").ignore_then(none_of(";").repeated()).to_slice().map(|s: &str| {
-    //         Query::Annotation(s.trim().to_string())
-    //     })
-    // }
+    fn annotation<'a>() -> impl Parser<'a, &'a [T<'a>], Query, extra::Err<Rich<'a, T<'a>>>> {
+        select! { T::Comment(s) => s }.map(|s: &str| Query::Annotation(s.trim().to_string()))
+    }
 
-    // fn null_statement<'a>() -> impl Parser<'a, &'a str, Query, extra::Err<Rich<'a, char>>> {
-    //     just("").to(Query::Null)
-    // }
+    fn null_statement<'a>() -> impl Parser<'a, &'a [T<'a>], Query, extra::Err<Rich<'a, T<'a>>>> {
+        just([]).to(Query::Null)
+    }
 
     // fn operator<'a>() -> impl Parser<'a, &'a str, Operator, extra::Err<Rich<'a, char>>> {
     //     choice((
@@ -385,8 +397,8 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
     choice((
         db_statement().map(Query::DBStmt),
         alter_statement().map(Query::AlterStmt),
-        //     annotation(),
-        //     null_statement(),
+        annotation(),
+        null_statement(),
     ))
     .then_ignore(just(T::Symbol(';')))
     .repeated()

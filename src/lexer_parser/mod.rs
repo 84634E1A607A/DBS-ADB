@@ -1,7 +1,7 @@
 mod lexer;
 mod parser;
 
-use lexer::{SQLToken, lexer, KeywordEnum};
+use lexer::{KeywordEnum, SQLToken, lexer};
 pub use parser::{AlterStatement, DBStatement, Query, parser};
 
 use chumsky::Parser;
@@ -64,7 +64,6 @@ mod tests {
         let result = lexer().parse(query);
         assert!(!result.has_errors());
         let tokens = result.unwrap();
-        dbg!(&tokens);
         assert_eq!(
             tokens,
             vec![
@@ -83,7 +82,6 @@ mod tests {
     fn test_db_stmt() {
         let query = "CREATE DATABASE test_db; DROP DATABASE test_db; SHOW DATABASES; USE test_db; SHOW TABLES; SHOW INDEXES;";
         let result = parse(query);
-        dbg!(&result);
         assert!(result.is_ok());
         let queries = result.unwrap();
         assert_eq!(
@@ -106,112 +104,83 @@ mod tests {
         assert!(result.is_err());
     }
 
-    //     #[test]
-    //     fn test_alter_stmt() {
-    //         let query = "
-    //         ALTER TABLE my_table ADD INDEX my_index (col1, col2);
-    //         ALTER TABLE my_table ADD INDEX (col3);
-    //         ALTER TABLE my_table DROP INDEX my_index;
-    //         ALTER TABLE my_table DROP PRIMARY KEY;
-    //         ALTER TABLE my_table DROP FOREIGN KEY fk_my_table;
-    //         ALTER TABLE my_table ADD PRIMARY KEY (col1, col2);
-    //         ALTER TABLE my_table ADD FOREIGN KEY fk_my_fkey (col1, col2, col3) REFERENCES ref_table (ref_col1, ref_col2, ref_col3);
-    //         ";
+    #[test]
+    fn test_alter_stmt() {
+        let query = "
+            ALTER TABLE my_table ADD INDEX my_index (col1, col2);
+            ALTER TABLE my_table ADD INDEX (col3);
+            ALTER TABLE my_table DROP INDEX my_index;
+            ALTER TABLE my_table DROP PRIMARY KEY;
+            ALTER TABLE my_table DROP FOREIGN KEY fk_my_table;
+            ALTER TABLE my_table ADD PRIMARY KEY (col1, col2);
+            ALTER TABLE my_table ADD FOREIGN KEY fk_my_fkey (col1, col2, col3) REFERENCES ref_table (ref_col1, ref_col2, ref_col3);
+            ";
 
-    //         let result = parser().parse(query);
-    //         assert!(!result.has_errors());
-    //         let queries = result.unwrap();
-    //         assert_eq!(queries.len(), 7);
-    //         assert_eq!(
-    //             queries[0],
-    //             Query::AlterStmt(AlterStatement::AddIndex(
-    //                 "my_table".into(),
-    //                 Some("my_index".into()),
-    //                 vec!["col1".into(), "col2".into()]
-    //             ))
-    //         );
-    //         assert_eq!(
-    //             queries[1],
-    //             Query::AlterStmt(AlterStatement::AddIndex(
-    //                 "my_table".into(),
-    //                 None,
-    //                 vec!["col3".into()]
-    //             ))
-    //         );
-    //         assert_eq!(
-    //             queries[2],
-    //             Query::AlterStmt(AlterStatement::DropIndex(
-    //                 "my_table".into(),
-    //                 "my_index".into()
-    //             ))
-    //         );
-    //         assert_eq!(
-    //             queries[3],
-    //             Query::AlterStmt(AlterStatement::DropPKey("my_table".into(), None))
-    //         );
-    //         assert_eq!(
-    //             queries[4],
-    //             Query::AlterStmt(AlterStatement::DropFKey(
-    //                 "my_table".into(),
-    //                 "fk_my_table".into()
-    //             ))
-    //         );
-    //         assert_eq!(
-    //             queries[5],
-    //             Query::AlterStmt(AlterStatement::AddPKey(
-    //                 "my_table".into(),
-    //                 vec!["col1".into(), "col2".into()]
-    //             ))
-    //         );
-    //         assert_eq!(
-    //             queries[6],
-    //             Query::AlterStmt(AlterStatement::AddFKey(
-    //                 "my_table".into(),
-    //                 Some("fk_my_fkey".into()),
-    //                 vec!["col1".into(), "col2".into(), "col3".into()],
-    //                 "ref_table".into(),
-    //                 vec!["ref_col1".into(), "ref_col2".into(), "ref_col3".into()]
-    //             ))
-    //         );
-    //     }
+        let result = parse(query);
+        assert!(result.is_ok());
+        let queries = result.unwrap();
+        assert_eq!(
+            queries,
+            vec![
+                Query::AlterStmt(AlterStatement::AddIndex(
+                    "my_table".into(),
+                    Some("my_index".into()),
+                    vec!["col1".into(), "col2".into()]
+                )),
+                Query::AlterStmt(AlterStatement::AddIndex(
+                    "my_table".into(),
+                    None,
+                    vec!["col3".into()]
+                )),
+                Query::AlterStmt(AlterStatement::DropIndex(
+                    "my_table".into(),
+                    "my_index".into()
+                )),
+                Query::AlterStmt(AlterStatement::DropPKey("my_table".into(), None)),
+                Query::AlterStmt(AlterStatement::DropFKey(
+                    "my_table".into(),
+                    "fk_my_table".into()
+                )),
+                Query::AlterStmt(AlterStatement::AddPKey(
+                    "my_table".into(),
+                    vec!["col1".into(), "col2".into()]
+                )),
+                Query::AlterStmt(AlterStatement::AddFKey(
+                    "my_table".into(),
+                    Some("fk_my_fkey".into()),
+                    vec!["col1".into(), "col2".into(), "col3".into()],
+                    "ref_table".into(),
+                    vec!["ref_col1".into(), "ref_col2".into(), "ref_col3".into()]
+                )),
+            ]
+        );
+    }
 
-    // #[test]
-    // fn test_alter_stmt_errors() {
-    //     let query = "ALTER TABLE my_table ADD FOREIGN KEY fk_my_fkey (col1, col2, col3) REFERENCES ref_table (ref_col1, ref_col2);";
+    #[test]
+    fn test_alter_stmt_errors() {
+        let query = "ALTER TABLE my_table ADD FOREIGN KEY fk_my_fkey (col1, col2, col3) REFERENCES ref_table (ref_col1, ref_col2);";
 
-    //     let result = parse(query);
-    //     assert!(result.is_err());
-    // }
+        let result = parse(query);
+        assert!(result.is_err());
+    }
 
-    //     #[test]
-    //     fn test_annotation() {
-    //         let query = "-- Leading Annotation;
-    // CREATE DATABASE test_db; -- Trailing Annotation
-    // -- Annotation ends here; DROP DATABASE test_db;;;;
-    //         ";
+    #[test]
+    fn test_annotation_null() {
+        let query = "-- Leading Annotation;
+CREATE DATABASE test_db; -- Trailing Annotation
+-- Annotation ends here; DROP DATABASE test_db;;;;";
 
-    //         let result = parser().parse(query);
-
-    //         result.errors().map(|e| println!("Error: {:?}", e)).count();
-
-    //         assert!(!result.has_errors());
-    //         let queries = result.unwrap();
-    //         assert_eq!(queries.len(), 7);
-    //         assert_eq!(
-    //             queries[0],
-    //             Query::Annotation("-- Leading Annotation".into())
-    //         );
-    //         assert_eq!(
-    //             queries[1],
-    //             Query::DBStmt(DBStatement::CreateDatabase("test_db".into()))
-    //         );
-    //         assert_eq!(
-    //             queries[2],
-    //             Query::Annotation("-- Trailing Annotation\n-- Annotation ends here".into())
-    //         );
-    //         assert_eq!(
-    //             queries[3],
-    //             Query::DBStmt(DBStatement::DropDatabase("test_db".into()))
-    //         );
-    // }
+        let result = parse(query);
+        dbg!(&result);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![
+            Query::Annotation("-- Leading Annotation".into()),
+            Query::DBStmt(DBStatement::CreateDatabase("test_db".into())),
+            Query::Annotation("-- Trailing Annotation\n-- Annotation ends here".into()),
+            Query::DBStmt(DBStatement::DropDatabase("test_db".into())),
+            Query::Null,
+            Query::Null,
+            Query::Null,
+        ]);
+    }
 }
