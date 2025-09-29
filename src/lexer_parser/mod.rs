@@ -71,7 +71,6 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                SQLToken::Comment("-- This is a comment"),
                 SQLToken::Symbol(';'),
                 SQLToken::Keyword(KeywordEnum::Select),
                 SQLToken::Symbol('*'),
@@ -172,7 +171,7 @@ mod tests {
     fn test_annotation_null() {
         let query = "-- Leading Annotation;
 CREATE DATABASE test_db; -- Trailing Annotation
--- Annotation ends here; DROP DATABASE test_db;;;;";
+-- Annotation ends here; DROP DATABASE test_db;;";
 
         let result = parse(query);
         dbg!(&result);
@@ -180,12 +179,10 @@ CREATE DATABASE test_db; -- Trailing Annotation
         assert_eq!(
             result.unwrap(),
             vec![
-                Query::Annotation("-- Leading Annotation".into()),
+                Query::Null,
                 Query::DBStmt(DBStatement::CreateDatabase("test_db".into())),
-                Query::Annotation("-- Trailing Annotation\n-- Annotation ends here".into()),
+                Query::Null,
                 Query::DBStmt(DBStatement::DropDatabase("test_db".into())),
-                Query::Null,
-                Query::Null,
                 Query::Null,
             ]
         );

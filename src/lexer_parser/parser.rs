@@ -159,7 +159,6 @@ pub enum Query {
     DBStmt(DBStatement),
     TableStmt(TableStatement),
     AlterStmt(AlterStatement),
-    Annotation(String),
     Null,
 }
 
@@ -361,12 +360,8 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
         .boxed()
     }
 
-    fn annotation<'a>() -> impl Parser<'a, &'a [T<'a>], Query, extra::Err<Rich<'a, T<'a>>>> {
-        select! { T::Comment(s) => s }.map(|s: &str| Query::Annotation(s.trim().to_string()))
-    }
-
     fn null_statement<'a>() -> impl Parser<'a, &'a [T<'a>], Query, extra::Err<Rich<'a, T<'a>>>> {
-        just([]).to(Query::Null)
+        just([]).or_not().to(Query::Null)
     }
 
     fn table_statement<'a>()
@@ -790,7 +785,6 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
         db_statement().map(Query::DBStmt),
         alter_statement().map(Query::AlterStmt),
         table_statement().map(Query::TableStmt),
-        annotation(),
         null_statement(),
     ))
     .then_ignore(just(T::Symbol(';')))

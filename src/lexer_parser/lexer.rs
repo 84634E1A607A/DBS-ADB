@@ -53,7 +53,6 @@ pub enum KeywordEnum {
     And,
     Load,
     Data,
-    Type,
     Default,
 }
 
@@ -65,15 +64,13 @@ pub enum SQLToken<'a> {
     Integer(i64),
     Float(f64),
     String(&'a str),
-    Comment(&'a str),
 }
 
 pub fn lexer<'a>() -> impl Parser<'a, &'a str, Vec<SQLToken<'a>>, extra::Err<Rich<'a, char>>> {
     let comment = just("--")
-        .ignore_then(none_of(";").repeated())
-        .to_slice()
-        .map(|s: &str| SQLToken::Comment(s))
-        .padded();
+        .ignore_then(none_of([';', '\n']).repeated())
+        .padded()
+        .ignored();
 
     let number = regex(r"-?\d+\.\d*")
         .map(|s: &str| SQLToken::Float(s.parse().unwrap()))
@@ -154,9 +151,8 @@ pub fn lexer<'a>() -> impl Parser<'a, &'a str, Vec<SQLToken<'a>>, extra::Err<Ric
     };
     let symbol = one_of("(),;=*<>.").map(SQLToken::Symbol).padded();
 
-    choice((
-        comment, number, integer, string, keyword, identifier, symbol,
-    ))
-    .repeated()
-    .collect()
+    choice((number, integer, string, keyword, identifier, symbol))
+        .separated_by(comment.repeated().or_not())
+        .collect()
+        .delimited_by(comment.repeated().or_not(), comment.repeated().or_not())
 }
