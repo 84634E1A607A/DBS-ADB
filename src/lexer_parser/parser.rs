@@ -25,7 +25,7 @@ pub enum DBStatement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
-    Number(f64),
+    Float(f64),
     Integer(i64),
     String(String),
     Null,
@@ -388,7 +388,7 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
 
         let value = select! {
             T::Integer(i) => Value::Integer(i),
-            T::Float(f) => Value::Number(f),
+            T::Float(f) => Value::Float(f),
             T::String(s) => Value::String(s.into()),
             T::Keyword(K::Null) => Value::Null,
         };

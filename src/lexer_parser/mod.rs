@@ -193,7 +193,7 @@ CREATE DATABASE test_db; -- Trailing Annotation
         let query = "
         DROP TABLE my_table;
         DESC my_table;
-        INSERT INTO my_table VALUES (1, 'value');
+        INSERT INTO my_table VALUES (1, 'value'), ('other', 4.2);
         LOAD DATA INFILE 'data.txt' INTO TABLE my_table FIELDS TERMINATED BY ',';
         ";
 
@@ -206,10 +206,16 @@ CREATE DATABASE test_db; -- Trailing Annotation
                 Query::TableStmt(parser::TableStatement::DescribeTable("my_table".into())),
                 Query::TableStmt(parser::TableStatement::InsertInto(
                     "my_table".into(),
-                    vec![vec![
-                        parser::Value::Integer(1),
-                        parser::Value::String("value".into())
-                    ]]
+                    vec![
+                        vec![
+                            parser::Value::Integer(1),
+                            parser::Value::String("value".into())
+                        ],
+                        vec![
+                            parser::Value::String("other".into()),
+                            parser::Value::Float(4.2)
+                        ]
+                    ]
                 )),
                 Query::TableStmt(parser::TableStatement::LoadDataInfile(
                     "data.txt".into(),
@@ -343,7 +349,7 @@ CREATE DATABASE test_db; -- Trailing Annotation
     }
 
     #[test]
-    fn test_create_table() {
+    fn test_table_stmt_create() {
         let query = "CREATE TABLE my_table (
             id INT NOT NULL DEFAULT 0,
             name VARCHAR(100) DEFAULT 'unknown',
