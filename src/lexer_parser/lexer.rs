@@ -53,6 +53,8 @@ pub enum KeywordEnum {
     And,
     Load,
     Data,
+    Type,
+    Default,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,7 +91,7 @@ pub fn lexer<'a>() -> impl Parser<'a, &'a str, Vec<SQLToken<'a>>, extra::Err<Ric
 
     let keyword = {
         // Use a regex with word boundaries so keywords aren't matched as prefixes of identifiers
-        let pattern = r"\b(?:CREATE|DATABASE|DATABASES|DROP|SHOW|USE|TABLES|INDEX|INDEXES|TABLE|ALTER|ADD|PRIMARY|KEY|FOREIGN|REFERENCES|INFILE|INTO|FIELDS|TERMINATED|BY|VALUES|INSERT|DELETE|FROM|UPDATE|SET|WHERE|SELECT|COUNT|AVERAGE|MAX|MIN|SUM|GROUP|ORDER|LIMIT|OFFSET|ASC|DESC|NULL|NOT|LIKE|INT|VARCHAR|FLOAT|IS|IN|AND|LOAD|DATA)\b";
+        let pattern = r"\b(?:CREATE|DATABASE|DATABASES|DROP|SHOW|USE|TABLES|INDEX|INDEXES|TABLE|ALTER|ADD|PRIMARY|KEY|FOREIGN|REFERENCES|INFILE|INTO|FIELDS|TERMINATED|BY|VALUES|INSERT|DELETE|FROM|UPDATE|SET|WHERE|SELECT|COUNT|AVERAGE|MAX|MIN|SUM|GROUP|ORDER|LIMIT|OFFSET|ASC|DESC|NULL|NOT|LIKE|INT|VARCHAR|FLOAT|IS|IN|AND|LOAD|DATA|DEFAULT)\b";
         regex(pattern)
             .map(|s: &str| {
                 SQLToken::Keyword(match s {
@@ -144,6 +146,7 @@ pub fn lexer<'a>() -> impl Parser<'a, &'a str, Vec<SQLToken<'a>>, extra::Err<Ric
                     "AND" => KeywordEnum::And,
                     "LOAD" => KeywordEnum::Load,
                     "DATA" => KeywordEnum::Data,
+                    "DEFAULT" => KeywordEnum::Default,
                     _ => unreachable!(),
                 })
             })

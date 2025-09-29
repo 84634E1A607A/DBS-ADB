@@ -101,7 +101,7 @@ pub struct SelectClause {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CreateTableField {
-    Col(String, ColumnType),
+    Col(String, ColumnType, bool, Value),
     Pkey(Box<AlterStatement>),
     Fkey(Box<AlterStatement>),
 }
@@ -668,6 +668,111 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
             )
             .boxed();
 
+        let column_type = choice((
+            just(T::Keyword(K::Int)).to(ColumnType::Int),
+            just(T::Keyword(K::Float)).to(ColumnType::Float),
+            just(T::Keyword(K::Varchar))
+                .ignore_then(
+                    select! { T::Integer(i) => i as usize }
+                        .delimited_by(just(T::Symbol('(')), just(T::Symbol(')'))),
+                )
+                .map(ColumnType::Char),
+        ))
+        .boxed();
+
+        let create_table_field = choice((
+            // Identifier type (NOT NULL)? (DEFAULT value)?
+            identifier()
+                .then(column_type)
+                .then(
+                    just([T::Keyword(K::Not), T::Keyword(K::Null)])
+                        .ignored()
+                        .or_not(),
+                )
+                .then(just(T::Keyword(K::Default)).ignore_then(value).or_not())
+                .map(
+                    |(((name, ctype), notnull), default_value): (
+                        ((&str, ColumnType), Option<()>),
+                        Option<Value>,
+                    )| {
+                        let notnull = notnull.is_some();
+                        let default_value = default_value.unwrap_or(Value::Null);
+
+                        CreateTableField::Col(name.into(), ctype, notnull, default_value)
+                    },
+                ),
+            // PRIMARY KEY (Identifier)? ( identifiers )
+            just([T::Keyword(K::Primary), T::Keyword(K::Key)])
+                .ignore_then(identifier().or_not())
+                .then(
+                    identifier()
+                        .separated_by(just(T::Symbol(',')))
+                        .collect()
+                        .delimited_by(just(T::Symbol('(')), just(T::Symbol(')'))),
+                )
+                .map(|(_pkey_name, fields): (Option<&str>, Vec<&str>)| {
+                    CreateTableField::Pkey(Box::new(AlterStatement::AddPKey(
+                        String::default(), // Table name will be filled later
+                        fields.into_iter().map(|s| s.into()).collect(),
+                    )))
+                }),
+            // FOREIGN KEY (Identifier)? ( identifiers ) REFERENCES Identifier ( identifiers )
+            just([T::Keyword(K::Foreign), T::Keyword(K::Key)])
+                .ignore_then(identifier().or_not())
+                .then(
+                    identifier()
+                        .separated_by(just(T::Symbol(',')))
+                        .collect()
+                        .delimited_by(just(T::Symbol('(')), just(T::Symbol(')'))),
+                )
+                .then(just(T::Keyword(K::References)).ignore_then(identifier()))
+                .then(
+                    identifier()
+                        .separated_by(just(T::Symbol(',')))
+                        .collect()
+                        .delimited_by(just(T::Symbol('(')), just(T::Symbol(')'))),
+                )
+                .validate(
+                    |(((fkey_name, fields), ref_table), ref_fields): (
+                        ((Option<&str>, Vec<&str>), &str),
+                        Vec<&str>,
+                    ), m, e| {
+                        if fields.len() != ref_fields.len() {
+                            e.emit(Rich::custom(
+                                m.span(),
+                                format!(
+                                    "number of fields ({}) does not match number of reference fields ({})",
+                                    fields.len(),
+                                    ref_fields.len()
+                                ),
+                            ));
+                        }
+
+                        CreateTableField::Fkey(Box::new(AlterStatement::AddFKey(
+                            String::default(), // Table name will be filled later
+                            fkey_name.map(|s| s.into()),
+                            fields.into_iter().map(|s| s.into()).collect(),
+                            ref_table.into(),
+                            ref_fields.into_iter().map(|s| s.into()).collect(),
+                        )))
+                    },
+                ),
+        ))
+        .boxed();
+
+        // CREATE TABLE Identifier
+        let create_table = just([T::Keyword(K::Create), T::Keyword(K::Table)])
+            .ignore_then(identifier())
+            .then(
+                // ( field_list )
+                create_table_field
+                    .separated_by(just(T::Symbol(',')))
+                    .collect()
+                    .delimited_by(just(T::Symbol('(')), just(T::Symbol(')'))),
+            )
+            .map(|(table_name, fields)| TableStatement::CreateTable(table_name.into(), fields))
+            .boxed();
+
         choice((
             drop_table,
             describe_table,
@@ -676,6 +781,7 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
             delete_from_table,
             update_table,
             select_table,
+            create_table,
         ))
         .boxed()
     }

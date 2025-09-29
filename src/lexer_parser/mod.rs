@@ -6,7 +6,7 @@ pub use parser::{AlterStatement, DBStatement, Query, parser};
 
 use chumsky::Parser;
 
-pub fn parse<'a>(input: &'a str) -> Result<Vec<Query>, String> {
+pub fn parse(input: &str) -> Result<Vec<Query>, String> {
     // Run lexer
     let tokens = match lexer().parse(input).into_result() {
         Ok(t) => t,
@@ -26,7 +26,7 @@ pub fn parse<'a>(input: &'a str) -> Result<Vec<Query>, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{result, vec};
+    use std::vec;
 
     use crate::lexer_parser::parser::{SelectClause, TableColumn, WhereClause};
 
@@ -343,5 +343,57 @@ CREATE DATABASE test_db; -- Trailing Annotation
         let query = "LOAD DATA INFILE 'data.txt' INTO TABLE my_table FIELDS TERMINATED BY 'abc';";
         let result = parse(query);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_table() {
+        let query = "CREATE TABLE my_table (
+            id INT NOT NULL DEFAULT 0,
+            name VARCHAR(100) DEFAULT 'unknown',
+            score FLOAT,
+            PRIMARY KEY pkey (id),
+            FOREIGN KEY fk_name (name) REFERENCES ref_table (ref_name)
+        );";
+
+        let result = parse(query);
+        dbg!(&result);
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            vec![Query::TableStmt(parser::TableStatement::CreateTable(
+                "my_table".into(),
+                vec![
+                    parser::CreateTableField::Col(
+                        "id".into(),
+                        parser::ColumnType::Int,
+                        true,
+                        parser::Value::Integer(0)
+                    ),
+                    parser::CreateTableField::Col(
+                        "name".into(),
+                        parser::ColumnType::Char(100),
+                        false,
+                        parser::Value::String("unknown".into())
+                    ),
+                    parser::CreateTableField::Col(
+                        "score".into(),
+                        parser::ColumnType::Float,
+                        false,
+                        parser::Value::Null
+                    ),
+                    parser::CreateTableField::Pkey(Box::new(AlterStatement::AddPKey(
+                        String::default(),
+                        vec!["id".into()]
+                    ))),
+                    parser::CreateTableField::Fkey(Box::new(AlterStatement::AddFKey(
+                        String::default(),
+                        Some("fk_name".into()),
+                        vec!["name".into()],
+                        "ref_table".into(),
+                        vec!["ref_name".into()]
+                    ))),
+                ]
+            ))]
+        );
     }
 }
