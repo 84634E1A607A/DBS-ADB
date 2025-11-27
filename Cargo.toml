@@ -3,5 +3,18 @@ name = "adb"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "adb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "adb"
+path = "src/main.rs"
+
 [dependencies]
 chumsky = { version = "^0.11", features = ["regex"] }
+lru = "0.12"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3.8"
