@@ -1,0 +1,463 @@
+use super::error::RecordResult;
+use super::page::Page;
+use super::record::{Record, RecordId};
+use super::schema::TableSchema;
+use crate::file::{BufferManager, FileHandle, PageId};
+
+/// Manages a table's file with multiple pages
+pub struct TableFile {
+    file_handle: FileHandle,
+    schema: TableSchema,
+    first_page_id: PageId,
+    page_count: usize,
+}
+
+impl TableFile {
+    /// Create a new table file
+    pub fn create(
+        buffer_mgr: &mut BufferManager,
+        path: &str,
+        schema: TableSchema,
+    ) -> RecordResult<Self> {
+        // Create the file
+        buffer_mgr.file_manager_mut().create_file(path)?;
+        let file_handle = buffer_mgr.file_manager_mut().open_file(path)?;
+
+        // Create the first page
+        let page = Page::new(schema.record_size())?;
+        let page_bytes = page.to_bytes();
+
+        // Write the first page
+        let page_buffer = buffer_mgr.get_page_mut(file_handle, 0)?;
+        page_buffer.copy_from_slice(&page_bytes);
+
+        Ok(Self {
+            file_handle,
+            schema,
+            first_page_id: 0,
+            page_count: 1,
+        })
+    }
+
+    /// Open an existing table file
+    pub fn open(
+        buffer_mgr: &mut BufferManager,
+        path: &str,
+        schema: TableSchema,
+    ) -> RecordResult<Self> {
+        let file_handle = buffer_mgr.file_manager_mut().open_file(path)?;
+        let page_count = buffer_mgr.file_manager_mut().get_page_count(file_handle)?;
+
+        Ok(Self {
+            file_handle,
+            schema,
+            first_page_id: 0,
+            page_count: if page_count > 0 { page_count } else { 1 },
+        })
+    }
+
+    /// Get table name
+    pub fn table_name(&self) -> &str {
+        self.schema.table_name()
+    }
+
+    /// Get schema
+    pub fn schema(&self) -> &TableSchema {
+        &self.schema
+    }
+
+    /// Insert a record into the table
+    pub fn insert_record(
+        &mut self,
+        buffer_mgr: &mut BufferManager,
+        record: &Record,
+    ) -> RecordResult<RecordId> {
+        // Validate record
+        self.schema.validate_record(record.values())?;
+
+        // Serialize record
+        let record_bytes = record.serialize(&self.schema)?;
+
+        // Find a page with free space
+        let mut page_id = self.first_page_id;
+        loop {
+            // Load the page
+            let page_buffer = buffer_mgr.get_page(self.file_handle, page_id)?;
+            let mut page = Page::from_bytes(page_buffer)?;
+
+            // Check if page has free space
+            if let Some(slot_id) = page.find_free_slot() {
+                // Found free slot, insert record
+                page.set_record(slot_id, &record_bytes)?;
+                page.mark_slot_used(slot_id)?;
+
+                // Write page back
+                let page_bytes = page.to_bytes();
+                let page_buffer = buffer_mgr.get_page_mut(self.file_handle, page_id)?;
+                page_buffer.copy_from_slice(&page_bytes);
+
+                return Ok(RecordId::new(page_id, slot_id));
+            }
+
+            // Check if there's a next page
+            let next_page = page.next_page();
+            if next_page == 0 {
+                // No next page, need to allocate a new one
+                let new_page_id = self.allocate_new_page(buffer_mgr, page_id)?;
+                page_id = new_page_id;
+                // Loop will try again with the new page
+            } else {
+                page_id = next_page;
+            }
+        }
+    }
+
+    /// Delete a record from the table
+    pub fn delete_record(
+        &mut self,
+        buffer_mgr: &mut BufferManager,
+        rid: RecordId,
+    ) -> RecordResult<()> {
+        // Load the page
+        let page_buffer = buffer_mgr.get_page(self.file_handle, rid.page_id)?;
+        let mut page = Page::from_bytes(page_buffer)?;
+
+        // Mark slot as free
+        page.mark_slot_free(rid.slot_id)?;
+
+        // Write page back
+        let page_bytes = page.to_bytes();
+        let page_buffer = buffer_mgr.get_page_mut(self.file_handle, rid.page_id)?;
+        page_buffer.copy_from_slice(&page_bytes);
+
+        Ok(())
+    }
+
+    /// Update a record in the table (in-place for fixed-length records)
+    pub fn update_record(
+        &mut self,
+        buffer_mgr: &mut BufferManager,
+        rid: RecordId,
+        record: &Record,
+    ) -> RecordResult<()> {
+        // Validate record
+        self.schema.validate_record(record.values())?;
+
+        // Serialize record
+        let record_bytes = record.serialize(&self.schema)?;
+
+        // Load the page
+        let page_buffer = buffer_mgr.get_page(self.file_handle, rid.page_id)?;
+        let mut page = Page::from_bytes(page_buffer)?;
+
+        // Update record in slot
+        page.set_record(rid.slot_id, &record_bytes)?;
+
+        // Write page back
+        let page_bytes = page.to_bytes();
+        let page_buffer = buffer_mgr.get_page_mut(self.file_handle, rid.page_id)?;
+        page_buffer.copy_from_slice(&page_bytes);
+
+        Ok(())
+    }
+
+    /// Get a record from the table
+    pub fn get_record(
+        &mut self,
+        buffer_mgr: &mut BufferManager,
+        rid: RecordId,
+    ) -> RecordResult<Record> {
+        // Load the page
+        let page_buffer = buffer_mgr.get_page(self.file_handle, rid.page_id)?;
+        let page = Page::from_bytes(page_buffer)?;
+
+        // Get record bytes
+        let record_bytes = page.get_record(rid.slot_id)?;
+
+        // Deserialize record
+        Record::deserialize(record_bytes, &self.schema)
+    }
+
+    /// Scan all records in the table
+    pub fn scan(
+        &mut self,
+        buffer_mgr: &mut BufferManager,
+    ) -> RecordResult<Vec<(RecordId, Record)>> {
+        let mut results = Vec::new();
+        let mut page_id = self.first_page_id;
+
+        loop {
+            // Check if page exists
+            if page_id >= self.page_count {
+                break;
+            }
+
+            // Load the page
+            let page_buffer = buffer_mgr.get_page(self.file_handle, page_id)?;
+            let page = Page::from_bytes(page_buffer)?;
+
+            // Scan all slots in this page
+            for slot_id in 0..page.slot_count() {
+                if page.is_slot_used(slot_id) {
+                    let record_bytes = page.get_record(slot_id)?;
+                    let record = Record::deserialize(record_bytes, &self.schema)?;
+                    results.push((RecordId::new(page_id, slot_id), record));
+                }
+            }
+
+            // Move to next page
+            let next_page = page.next_page();
+            if next_page == 0 {
+                break;
+            }
+            page_id = next_page;
+        }
+
+        Ok(results)
+    }
+
+    /// Allocate a new page and link it from the previous page
+    fn allocate_new_page(
+        &mut self,
+        buffer_mgr: &mut BufferManager,
+        prev_page_id: PageId,
+    ) -> RecordResult<PageId> {
+        let new_page_id = self.page_count;
+        self.page_count += 1;
+
+        // Create new page
+        let new_page = Page::new(self.schema.record_size())?;
+        let new_page_bytes = new_page.to_bytes();
+
+        // Write new page
+        let page_buffer = buffer_mgr.get_page_mut(self.file_handle, new_page_id)?;
+        page_buffer.copy_from_slice(&new_page_bytes);
+
+        // Update previous page's next_page pointer
+        let prev_page_buffer = buffer_mgr.get_page(self.file_handle, prev_page_id)?;
+        let mut prev_page = Page::from_bytes(prev_page_buffer)?;
+        prev_page.set_next_page(new_page_id);
+
+        let prev_page_bytes = prev_page.to_bytes();
+        let prev_page_buffer = buffer_mgr.get_page_mut(self.file_handle, prev_page_id)?;
+        prev_page_buffer.copy_from_slice(&prev_page_bytes);
+
+        Ok(new_page_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file::PagedFileManager;
+    use crate::record::{ColumnDef, DataType, Value};
+    use tempfile::TempDir;
+
+    fn create_test_schema() -> TableSchema {
+        TableSchema::new(
+            "test_table".to_string(),
+            vec![
+                ColumnDef::new("id".to_string(), DataType::Int, true, Value::Null),
+                ColumnDef::new("name".to_string(), DataType::Char(20), false, Value::Null),
+                ColumnDef::new("score".to_string(), DataType::Float, false, Value::Null),
+            ],
+        )
+    }
+
+    fn setup_test_env() -> (TempDir, BufferManager) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_manager = PagedFileManager::new();
+        let buffer_manager = BufferManager::new(file_manager);
+        (temp_dir, buffer_manager)
+    }
+
+    #[test]
+    fn test_create_table_file() {
+        let (temp_dir, mut buffer_mgr) = setup_test_env();
+        let test_file = temp_dir.path().join("test.tbl");
+        let schema = create_test_schema();
+
+        let table =
+            TableFile::create(&mut buffer_mgr, test_file.to_str().unwrap(), schema).unwrap();
+        assert_eq!(table.table_name(), "test_table");
+        assert_eq!(table.page_count, 1);
+    }
+
+    #[test]
+    fn test_insert_and_get_record() {
+        let (temp_dir, mut buffer_mgr) = setup_test_env();
+        let test_file = temp_dir.path().join("test.tbl");
+        let schema = create_test_schema();
+
+        let mut table =
+            TableFile::create(&mut buffer_mgr, test_file.to_str().unwrap(), schema).unwrap();
+
+        // Insert a record
+        let record = Record::new(vec![
+            Value::Int(1),
+            Value::String("Alice".to_string()),
+            Value::Float(95.5),
+        ]);
+
+        let rid = table.insert_record(&mut buffer_mgr, &record).unwrap();
+
+        // Get the record back
+        let retrieved = table.get_record(&mut buffer_mgr, rid).unwrap();
+        assert_eq!(record, retrieved);
+    }
+
+    #[test]
+    fn test_insert_multiple_records() {
+        let (temp_dir, mut buffer_mgr) = setup_test_env();
+        let test_file = temp_dir.path().join("test.tbl");
+        let schema = create_test_schema();
+
+        let mut table =
+            TableFile::create(&mut buffer_mgr, test_file.to_str().unwrap(), schema).unwrap();
+
+        // Insert multiple records
+        let mut rids = Vec::new();
+        for i in 0..10 {
+            let record = Record::new(vec![
+                Value::Int(i),
+                Value::String(format!("User{}", i)),
+                Value::Float(i as f64 * 10.0),
+            ]);
+            let rid = table.insert_record(&mut buffer_mgr, &record).unwrap();
+            rids.push((rid, record));
+        }
+
+        // Verify all records
+        for (rid, expected) in &rids {
+            let retrieved = table.get_record(&mut buffer_mgr, *rid).unwrap();
+            assert_eq!(*expected, retrieved);
+        }
+    }
+
+    #[test]
+    fn test_delete_record() {
+        let (temp_dir, mut buffer_mgr) = setup_test_env();
+        let test_file = temp_dir.path().join("test.tbl");
+        let schema = create_test_schema();
+
+        let mut table =
+            TableFile::create(&mut buffer_mgr, test_file.to_str().unwrap(), schema).unwrap();
+
+        // Insert a record
+        let record = Record::new(vec![
+            Value::Int(1),
+            Value::String("Alice".to_string()),
+            Value::Float(95.5),
+        ]);
+        let rid = table.insert_record(&mut buffer_mgr, &record).unwrap();
+
+        // Delete it
+        table.delete_record(&mut buffer_mgr, rid).unwrap();
+
+        // Try to get it (should fail because slot is free)
+        let result = table.get_record(&mut buffer_mgr, rid);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_record() {
+        let (temp_dir, mut buffer_mgr) = setup_test_env();
+        let test_file = temp_dir.path().join("test.tbl");
+        let schema = create_test_schema();
+
+        let mut table =
+            TableFile::create(&mut buffer_mgr, test_file.to_str().unwrap(), schema).unwrap();
+
+        // Insert a record
+        let record = Record::new(vec![
+            Value::Int(1),
+            Value::String("Alice".to_string()),
+            Value::Float(95.5),
+        ]);
+        let rid = table.insert_record(&mut buffer_mgr, &record).unwrap();
+
+        // Update it
+        let updated = Record::new(vec![
+            Value::Int(1),
+            Value::String("Bob".to_string()),
+            Value::Float(85.0),
+        ]);
+        table.update_record(&mut buffer_mgr, rid, &updated).unwrap();
+
+        // Verify the update
+        let retrieved = table.get_record(&mut buffer_mgr, rid).unwrap();
+        assert_eq!(updated, retrieved);
+    }
+
+    #[test]
+    fn test_scan_records() {
+        let (temp_dir, mut buffer_mgr) = setup_test_env();
+        let test_file = temp_dir.path().join("test.tbl");
+        let schema = create_test_schema();
+
+        let mut table =
+            TableFile::create(&mut buffer_mgr, test_file.to_str().unwrap(), schema).unwrap();
+
+        // Insert multiple records
+        let mut expected = Vec::new();
+        for i in 0..5 {
+            let record = Record::new(vec![
+                Value::Int(i),
+                Value::String(format!("User{}", i)),
+                Value::Float(i as f64 * 10.0),
+            ]);
+            let rid = table.insert_record(&mut buffer_mgr, &record).unwrap();
+            expected.push((rid, record));
+        }
+
+        // Scan all records
+        let scanned = table.scan(&mut buffer_mgr).unwrap();
+        assert_eq!(scanned.len(), expected.len());
+
+        // Verify all records (order should match)
+        for ((rid1, rec1), (rid2, rec2)) in scanned.iter().zip(expected.iter()) {
+            assert_eq!(rid1, rid2);
+            assert_eq!(rec1, rec2);
+        }
+    }
+
+    #[test]
+    fn test_multi_page_insertion() {
+        let (temp_dir, mut buffer_mgr) = setup_test_env();
+        let test_file = temp_dir.path().join("test.tbl");
+
+        // Create a schema with small records to fit many per page
+        let schema = TableSchema::new(
+            "test".to_string(),
+            vec![ColumnDef::new(
+                "id".to_string(),
+                DataType::Int,
+                true,
+                Value::Null,
+            )],
+        );
+
+        let mut table =
+            TableFile::create(&mut buffer_mgr, test_file.to_str().unwrap(), schema).unwrap();
+
+        // Insert enough records to span multiple pages
+        let slot_count = Page::calculate_slot_count(5); // 5 bytes: 1 bitmap + 4 int
+        let insert_count = slot_count + 10; // More than one page
+
+        let mut rids = Vec::new();
+        for i in 0..insert_count {
+            let record = Record::new(vec![Value::Int(i as i32)]);
+            let rid = table.insert_record(&mut buffer_mgr, &record).unwrap();
+            rids.push(rid);
+        }
+
+        // Verify we used multiple pages
+        assert!(table.page_count > 1);
+
+        // Verify all records are accessible
+        for (i, rid) in rids.iter().enumerate() {
+            let record = table.get_record(&mut buffer_mgr, *rid).unwrap();
+            assert_eq!(record.values()[0], Value::Int(i as i32));
+        }
+    }
+}
