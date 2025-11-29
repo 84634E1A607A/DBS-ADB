@@ -145,10 +145,10 @@ impl LeafNode {
     pub fn search_all(&self, key: BPlusKey) -> Vec<RecordId> {
         let mut results = Vec::new();
         for (i, &k) in self.keys.iter().enumerate() {
-            if k == key {
-                results.push(self.values[i]);
-            } else if k > key {
-                break;
+            match k.cmp(&key) {
+                std::cmp::Ordering::Equal => results.push(self.values[i]),
+                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Less => {}
             }
         }
         results

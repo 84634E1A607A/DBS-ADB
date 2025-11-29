@@ -93,7 +93,7 @@ impl Page {
             )));
         }
 
-        let bitmap_size = (slot_count + 7) / 8;
+        let bitmap_size = slot_count.div_ceil(8);
         let data_size = slot_count * record_size;
 
         Ok(Self {
@@ -116,7 +116,7 @@ impl Page {
 
         let slot_count = header.slot_count as usize;
         let record_size = header.record_size as usize;
-        let bitmap_size = (slot_count + 7) / 8;
+        let bitmap_size = slot_count.div_ceil(8);
 
         let bitmap_start = PageHeader::SIZE;
         let bitmap_end = bitmap_start + bitmap_size;
@@ -162,12 +162,7 @@ impl Page {
             return None;
         }
 
-        for slot_id in 0..self.header.slot_count as usize {
-            if !self.is_slot_used(slot_id) {
-                return Some(slot_id);
-            }
-        }
-        None
+        (0..self.header.slot_count as usize).find(|&slot_id| !self.is_slot_used(slot_id))
     }
 
     /// Check if a slot is used

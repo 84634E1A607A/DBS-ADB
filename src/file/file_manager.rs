@@ -195,7 +195,7 @@ impl PagedFileManager {
             .ok_or(FileError::InvalidHandle(handle.0))?;
 
         let file_size = entry.file.metadata()?.len();
-        let page_count = ((file_size + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64) as usize;
+        let page_count = file_size.div_ceil(PAGE_SIZE as u64) as usize;
         Ok(page_count)
     }
 

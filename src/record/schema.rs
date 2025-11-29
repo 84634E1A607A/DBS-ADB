@@ -39,7 +39,7 @@ pub struct TableSchema {
 impl TableSchema {
     /// Create a new table schema
     pub fn new(table_name: String, columns: Vec<ColumnDef>) -> Self {
-        let null_bitmap_size = (columns.len() + 7) / 8; // ⌈n/8⌉
+        let null_bitmap_size = columns.len().div_ceil(8); // ⌈n/8⌉
         let record_size = null_bitmap_size + columns.iter().map(|c| c.size()).sum::<usize>();
 
         Self {

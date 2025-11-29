@@ -121,7 +121,7 @@ impl BPlusTree {
 
     /// Minimum entries in a leaf node (except root)
     fn min_leaf_entries(&self) -> usize {
-        (self.order - 1 + 1) / 2 // ceil((m-1)/2)
+        (self.order - 1).div_ceil(2) // ceil((m-1)/2)
     }
 
     /// Maximum children in an internal node
@@ -131,7 +131,7 @@ impl BPlusTree {
 
     /// Minimum children in an internal node (except root)
     fn min_internal_children(&self) -> usize {
-        (self.order + 1) / 2 // ceil(m/2)
+        self.order.div_ceil(2) // ceil(m/2)
     }
 
     // ========== Node Management ==========
@@ -311,7 +311,7 @@ impl BPlusTree {
             let leaf = self
                 .get_node_mut(leaf_id)
                 .and_then(|n| n.as_leaf_mut())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(leaf_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(leaf_id))?;
             leaf.insert(key, rid);
         }
 
@@ -341,7 +341,7 @@ impl BPlusTree {
             let leaf = self
                 .get_node_mut(leaf_id)
                 .and_then(|n| n.as_leaf_mut())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(leaf_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(leaf_id))?;
 
             let mut right = leaf.split();
             let left_max = leaf.max_key().unwrap_or(0);
@@ -354,7 +354,7 @@ impl BPlusTree {
             let leaf = self
                 .get_node_mut(leaf_id)
                 .and_then(|n| n.as_leaf_mut())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(leaf_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(leaf_id))?;
             right.next = leaf.next.take();
             leaf.next = Some(right_id);
 
@@ -396,7 +396,7 @@ impl BPlusTree {
             let parent = self
                 .get_node_mut(parent_id)
                 .and_then(|n| n.as_internal_mut())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(parent_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(parent_id))?;
 
             // Update the key for the left child
             parent.keys[child_idx] = left_key;
@@ -431,7 +431,7 @@ impl BPlusTree {
             let node = self
                 .get_node_mut(node_id)
                 .and_then(|n| n.as_internal_mut())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(node_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(node_id))?;
 
             let mid = node.len() / 2;
 
@@ -467,12 +467,12 @@ impl BPlusTree {
             let max_key = self
                 .get_node(current_node)
                 .and_then(|n| n.max_key())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(current_node))?;
+                .ok_or(BPlusTreeError::NodeNotFound(current_node))?;
 
             let parent = self
                 .get_node_mut(parent_id)
                 .and_then(|n| n.as_internal_mut())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(parent_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(parent_id))?;
 
             // Only update if the key actually changed
             if parent.keys[child_idx] != max_key {
@@ -507,7 +507,7 @@ impl BPlusTree {
             let leaf = self
                 .get_node_mut(leaf_id)
                 .and_then(|n| n.as_leaf_mut())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(leaf_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(leaf_id))?;
             leaf.delete(key)
         };
 
@@ -541,7 +541,7 @@ impl BPlusTree {
             let leaf = self
                 .get_node_mut(leaf_id)
                 .and_then(|n| n.as_leaf_mut())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(leaf_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(leaf_id))?;
             leaf.delete_entry(key, rid)
         };
 
@@ -595,7 +595,7 @@ impl BPlusTree {
             let parent = self
                 .get_node(parent_id)
                 .and_then(|n| n.as_internal())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(parent_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(parent_id))?;
 
             if child_idx > 0 {
                 (parent.children[child_idx - 1], true)
@@ -646,7 +646,7 @@ impl BPlusTree {
                 let sibling = self
                     .get_node_mut(sibling_id)
                     .and_then(|n| n.as_leaf_mut())
-                    .ok_or_else(|| BPlusTreeError::NodeNotFound(sibling_id))?;
+                    .ok_or(BPlusTreeError::NodeNotFound(sibling_id))?;
 
                 let key = sibling.keys.pop().unwrap();
                 let value = sibling.values.pop().unwrap();
@@ -658,7 +658,7 @@ impl BPlusTree {
                 let leaf = self
                     .get_node_mut(leaf_id)
                     .and_then(|n| n.as_leaf_mut())
-                    .ok_or_else(|| BPlusTreeError::NodeNotFound(leaf_id))?;
+                    .ok_or(BPlusTreeError::NodeNotFound(leaf_id))?;
 
                 leaf.keys.insert(0, key);
                 leaf.values.insert(0, value);
@@ -673,7 +673,7 @@ impl BPlusTree {
             let parent = self
                 .get_node_mut(parent_id)
                 .and_then(|n| n.as_internal_mut())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(parent_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(parent_id))?;
 
             parent.keys[child_idx - 1] = sibling_max;
         } else {
@@ -682,7 +682,7 @@ impl BPlusTree {
                 let sibling = self
                     .get_node_mut(sibling_id)
                     .and_then(|n| n.as_leaf_mut())
-                    .ok_or_else(|| BPlusTreeError::NodeNotFound(sibling_id))?;
+                    .ok_or(BPlusTreeError::NodeNotFound(sibling_id))?;
 
                 let key = sibling.keys.remove(0);
                 let value = sibling.values.remove(0);
@@ -694,7 +694,7 @@ impl BPlusTree {
                 let leaf = self
                     .get_node_mut(leaf_id)
                     .and_then(|n| n.as_leaf_mut())
-                    .ok_or_else(|| BPlusTreeError::NodeNotFound(leaf_id))?;
+                    .ok_or(BPlusTreeError::NodeNotFound(leaf_id))?;
 
                 leaf.keys.push(key);
                 leaf.values.push(value);
@@ -709,7 +709,7 @@ impl BPlusTree {
             let parent = self
                 .get_node_mut(parent_id)
                 .and_then(|n| n.as_internal_mut())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(parent_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(parent_id))?;
 
             parent.keys[child_idx] = leaf_max;
         }
@@ -740,7 +740,7 @@ impl BPlusTree {
                 let right = self
                     .get_node(right_id)
                     .and_then(|n| n.as_leaf())
-                    .ok_or_else(|| BPlusTreeError::NodeNotFound(right_id))?;
+                    .ok_or(BPlusTreeError::NodeNotFound(right_id))?;
 
                 right
                     .keys
@@ -758,7 +758,7 @@ impl BPlusTree {
             let left = self
                 .get_node_mut(left_id)
                 .and_then(|n| n.as_leaf_mut())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(left_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(left_id))?;
 
             for (k, v) in right_entries {
                 left.keys.push(k);
@@ -799,7 +799,7 @@ impl BPlusTree {
             let parent = self
                 .get_node_mut(parent_id)
                 .and_then(|n| n.as_internal_mut())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(parent_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(parent_id))?;
 
             parent.keys.remove(remove_idx);
             parent.children.remove(remove_idx);
@@ -843,7 +843,7 @@ impl BPlusTree {
                 let parent = self
                     .get_node(parent_id)
                     .and_then(|n| n.as_internal())
-                    .ok_or_else(|| BPlusTreeError::NodeNotFound(parent_id))?;
+                    .ok_or(BPlusTreeError::NodeNotFound(parent_id))?;
                 parent.children[0]
             };
 
@@ -876,7 +876,7 @@ impl BPlusTree {
             let parent = self
                 .get_node(parent_id)
                 .and_then(|n| n.as_internal())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(parent_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(parent_id))?;
 
             if child_idx > 0 {
                 (parent.children[child_idx - 1], true)
@@ -926,7 +926,7 @@ impl BPlusTree {
                 let sibling = self
                     .get_node_mut(sibling_id)
                     .and_then(|n| n.as_internal_mut())
-                    .ok_or_else(|| BPlusTreeError::NodeNotFound(sibling_id))?;
+                    .ok_or(BPlusTreeError::NodeNotFound(sibling_id))?;
 
                 let key = sibling.keys.pop().unwrap();
                 let child = sibling.children.pop().unwrap();
@@ -938,7 +938,7 @@ impl BPlusTree {
                 let node = self
                     .get_node_mut(node_id)
                     .and_then(|n| n.as_internal_mut())
-                    .ok_or_else(|| BPlusTreeError::NodeNotFound(node_id))?;
+                    .ok_or(BPlusTreeError::NodeNotFound(node_id))?;
 
                 node.keys.insert(0, key);
                 node.children.insert(0, child);
@@ -953,7 +953,7 @@ impl BPlusTree {
             let parent = self
                 .get_node_mut(parent_id)
                 .and_then(|n| n.as_internal_mut())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(parent_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(parent_id))?;
 
             parent.keys[child_idx - 1] = sibling_max;
         } else {
@@ -962,7 +962,7 @@ impl BPlusTree {
                 let sibling = self
                     .get_node_mut(sibling_id)
                     .and_then(|n| n.as_internal_mut())
-                    .ok_or_else(|| BPlusTreeError::NodeNotFound(sibling_id))?;
+                    .ok_or(BPlusTreeError::NodeNotFound(sibling_id))?;
 
                 let key = sibling.keys.remove(0);
                 let child = sibling.children.remove(0);
@@ -974,7 +974,7 @@ impl BPlusTree {
                 let node = self
                     .get_node_mut(node_id)
                     .and_then(|n| n.as_internal_mut())
-                    .ok_or_else(|| BPlusTreeError::NodeNotFound(node_id))?;
+                    .ok_or(BPlusTreeError::NodeNotFound(node_id))?;
 
                 node.keys.push(key);
                 node.children.push(child);
@@ -989,7 +989,7 @@ impl BPlusTree {
             let parent = self
                 .get_node_mut(parent_id)
                 .and_then(|n| n.as_internal_mut())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(parent_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(parent_id))?;
 
             parent.keys[child_idx] = node_max;
         }
@@ -1020,7 +1020,7 @@ impl BPlusTree {
                 let right = self
                     .get_node(right_id)
                     .and_then(|n| n.as_internal())
-                    .ok_or_else(|| BPlusTreeError::NodeNotFound(right_id))?;
+                    .ok_or(BPlusTreeError::NodeNotFound(right_id))?;
 
                 (right.keys.clone(), right.children.clone())
             };
@@ -1028,7 +1028,7 @@ impl BPlusTree {
             let left = self
                 .get_node_mut(left_id)
                 .and_then(|n| n.as_internal_mut())
-                .ok_or_else(|| BPlusTreeError::NodeNotFound(left_id))?;
+                .ok_or(BPlusTreeError::NodeNotFound(left_id))?;
 
             left.keys.extend(right_keys);
             left.children.extend(right_children);
@@ -1068,7 +1068,7 @@ impl<'a> BPlusTreeIter<'a> {
     }
 }
 
-impl<'a> Iterator for BPlusTreeIter<'a> {
+impl Iterator for BPlusTreeIter<'_> {
     type Item = (BPlusKey, RecordId);
 
     fn next(&mut self) -> Option<Self::Item> {
