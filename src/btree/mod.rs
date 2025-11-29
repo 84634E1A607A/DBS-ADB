@@ -776,11 +776,11 @@ impl BPlusTree {
         &mut self,
         parent_id: NodeId,
         remove_idx: usize,
-        remaining_child_id: NodeId,
+        _remaining_child_id: NodeId,
         parent_path: Vec<(NodeId, usize)>,
     ) -> BPlusTreeResult<()> {
-        // Remove from parent
-        {
+        // Remove from parent and get the remaining child ID to update
+        let remaining_child_id_to_update = {
             let parent = self
                 .get_node_mut(parent_id)
                 .and_then(|n| n.as_internal_mut())
@@ -789,14 +789,29 @@ impl BPlusTree {
             parent.keys.remove(remove_idx);
             parent.children.remove(remove_idx);
 
-            // Update the key of the remaining child
+            // Get the remaining child that needs key update
             let remaining_idx = if remove_idx > 0 { remove_idx - 1 } else { 0 };
             if remaining_idx < parent.children.len() {
-                let child_max = self
-                    .get_node(parent.children[remaining_idx])
-                    .and_then(|n| n.max_key())
-                    .unwrap_or(0);
-                parent.keys[remaining_idx] = child_max;
+                Some((remaining_idx, parent.children[remaining_idx]))
+            } else {
+                None
+            }
+        };
+
+        // Update the key for the remaining child
+        if let Some((remaining_idx, child_id)) = remaining_child_id_to_update {
+            let child_max = self
+                .get_node(child_id)
+                .and_then(|n| n.max_key())
+                .unwrap_or(0);
+
+            if let Some(parent) = self
+                .get_node_mut(parent_id)
+                .and_then(|n| n.as_internal_mut())
+            {
+                if remaining_idx < parent.keys.len() {
+                    parent.keys[remaining_idx] = child_max;
+                }
             }
         }
 
