@@ -459,19 +459,29 @@ impl BPlusTree {
         node_id: NodeId,
         path: &[(NodeId, usize)],
     ) -> BPlusTreeResult<()> {
-        let max_key = self
-            .get_node(node_id)
-            .and_then(|n| n.max_key())
-            .ok_or_else(|| BPlusTreeError::NodeNotFound(node_id))?;
-
         // Update keys in ancestors from bottom to top
+        // Each level needs to be updated with the actual max of that subtree
+        let mut current_node = node_id;
+
         for &(parent_id, child_idx) in path.iter().rev() {
+            let max_key = self
+                .get_node(current_node)
+                .and_then(|n| n.max_key())
+                .ok_or_else(|| BPlusTreeError::NodeNotFound(current_node))?;
+
             let parent = self
                 .get_node_mut(parent_id)
                 .and_then(|n| n.as_internal_mut())
                 .ok_or_else(|| BPlusTreeError::NodeNotFound(parent_id))?;
 
-            parent.keys[child_idx] = max_key;
+            // Only update if the key actually changed
+            if parent.keys[child_idx] != max_key {
+                parent.keys[child_idx] = max_key;
+                current_node = parent_id;
+            } else {
+                // If the key didn't change, no need to update higher levels
+                break;
+            }
         }
 
         Ok(())
@@ -757,8 +767,13 @@ impl BPlusTree {
             left.next = right_next;
         }
 
-        // Update first_leaf if needed
+        // Update first_leaf if needed - when right node is being removed and was first_leaf
+        // This shouldn't normally happen since left should come before right
+        // But handle it just in case: if right_id is first_leaf, left should be new first
+        // (though this is technically a bug in tree structure)
         if self.first_leaf == Some(right_id) {
+            // This is wrong - if right was first_leaf, left should have been before it
+            // Just set to left to avoid pointing to freed node
             self.first_leaf = Some(left_id);
         }
 
@@ -1381,6 +1396,38 @@ mod tests {
                 assert_eq!(tree.search(i), Some(rid(1, i as usize)));
             }
         }
+    }
+
+    #[test]
+    fn test_delete_stress_debug() {
+        // This test verifies that search works correctly after multiple deletions
+        // which trigger tree rebalancing (redistribution/merge operations)
+        let mut tree = BPlusTree::new(4).unwrap();
+
+        // Insert 20 entries to create a multi-level tree
+        for i in 0..20 {
+            tree.insert(i, rid(1, i as usize)).unwrap();
+        }
+        assert_eq!(tree.len(), 20);
+        assert!(tree.height() >= 2);
+
+        // Delete every other entry starting from 0
+        for i in (0..20).step_by(2) {
+            tree.delete(i).unwrap();
+
+            // Verify all remaining entries are still searchable
+            for j in 0..20 {
+                let should_exist = j % 2 != 0 || j > i;
+                let found = tree.search(j).is_some();
+                assert_eq!(
+                    found, should_exist,
+                    "After delete({}): Key {} should_exist={} but found={}",
+                    i, j, should_exist, found
+                );
+            }
+        }
+
+        assert_eq!(tree.len(), 10);
     }
 
     #[test]
