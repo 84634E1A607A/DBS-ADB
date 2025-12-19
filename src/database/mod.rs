@@ -274,6 +274,12 @@ impl DatabaseManager {
 
         let db_name = self.current_db.as_ref().unwrap();
         let table_path = self.table_path(db_name, table);
+        let table_path_str = table_path.to_string_lossy().to_string();
+
+        // Try to open table if not already open (ignore error if already open)
+        let _ = self
+            .record_manager
+            .open_table(&table_path_str, schema.clone());
 
         let mut inserted = 0;
         for row in rows {
@@ -316,6 +322,12 @@ impl DatabaseManager {
 
         let db_name = self.current_db.as_ref().unwrap();
         let table_path = self.table_path(db_name, table);
+        let table_path_str = table_path.to_string_lossy().to_string();
+
+        // Try to open table if not already open (ignore error if already open)
+        let _ = self
+            .record_manager
+            .open_table(&table_path_str, schema.clone());
 
         // Scan and find matching records
         let records = self.record_manager.scan(table)?;
@@ -342,16 +354,25 @@ impl DatabaseManager {
         updates: Vec<(String, ParserValue)>,
         where_clauses: Option<Vec<WhereClause>>,
     ) -> DatabaseResult<usize> {
-        let metadata = self
-            .current_metadata
-            .as_ref()
-            .ok_or(DatabaseError::NoDatabaseSelected)?;
+        let (table_meta, schema) = {
+            let metadata = self
+                .current_metadata
+                .as_ref()
+                .ok_or(DatabaseError::NoDatabaseSelected)?;
 
-        let table_meta = metadata.get_table(table)?;
-        let schema = self.metadata_to_schema(table_meta);
+            let table_meta = metadata.get_table(table)?.clone();
+            let schema = self.metadata_to_schema(&table_meta);
+            (table_meta, schema)
+        };
 
         let db_name = self.current_db.as_ref().unwrap();
         let table_path = self.table_path(db_name, table);
+        let table_path_str = table_path.to_string_lossy().to_string();
+
+        // Try to open table if not already open (ignore error if already open)
+        let _ = self
+            .record_manager
+            .open_table(&table_path_str, schema.clone());
 
         // Build update map
         let mut update_map = HashMap::new();
@@ -414,6 +435,13 @@ impl DatabaseManager {
 
         let db_name = self.current_db.as_ref().unwrap();
         let table_path = self.table_path(db_name, table_name);
+        let table_path_str = table_path.to_string_lossy().to_string();
+
+        // Try to open table if not already open (ignore error if already open)
+        if self.record_manager.scan(table_name).is_err() {
+            self.record_manager
+                .open_table(&table_path_str, schema.clone())?;
+        }
 
         // Determine selected columns
         let selected_columns = match &clause.selectors {
@@ -449,6 +477,14 @@ impl DatabaseManager {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        // Ensure table is open
+        let table_path_str = table_path.to_string_lossy().to_string();
+        if self.record_manager.scan(&table_name).is_err() {
+            // Table not open, open it
+            self.record_manager
+                .open_table(&table_path_str, schema.clone())?;
+        }
 
         // Scan table
         let records = self.record_manager.scan(table_name)?;

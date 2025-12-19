@@ -80,12 +80,7 @@ fn test_create_table() {
 
     // Create table
     let fields = vec![
-        CreateTableField::Col(
-            "id".to_string(),
-            ColumnType::Int,
-            true,
-            ParserValue::Null,
-        ),
+        CreateTableField::Col("id".to_string(), ColumnType::Int, true, ParserValue::Null),
         CreateTableField::Col(
             "name".to_string(),
             ColumnType::Char(20),
@@ -163,24 +158,14 @@ fn test_insert_and_select() {
     db_manager.use_database("testdb").unwrap();
 
     let fields = vec![
-        CreateTableField::Col(
-            "a".to_string(),
-            ColumnType::Int,
-            true,
-            ParserValue::Null,
-        ),
+        CreateTableField::Col("a".to_string(), ColumnType::Int, true, ParserValue::Null),
         CreateTableField::Col(
             "b".to_string(),
             ColumnType::Char(10),
             true,
             ParserValue::Null,
         ),
-        CreateTableField::Col(
-            "c".to_string(),
-            ColumnType::Float,
-            true,
-            ParserValue::Null,
-        ),
+        CreateTableField::Col("c".to_string(), ColumnType::Float, true, ParserValue::Null),
     ];
 
     db_manager.create_table("test", fields).unwrap();
@@ -239,24 +224,14 @@ fn test_select_specific_columns() {
     db_manager.use_database("testdb").unwrap();
 
     let fields = vec![
-        CreateTableField::Col(
-            "a".to_string(),
-            ColumnType::Int,
-            true,
-            ParserValue::Null,
-        ),
+        CreateTableField::Col("a".to_string(), ColumnType::Int, true, ParserValue::Null),
         CreateTableField::Col(
             "b".to_string(),
             ColumnType::Char(10),
             true,
             ParserValue::Null,
         ),
-        CreateTableField::Col(
-            "c".to_string(),
-            ColumnType::Float,
-            true,
-            ParserValue::Null,
-        ),
+        CreateTableField::Col("c".to_string(), ColumnType::Float, true, ParserValue::Null),
     ];
 
     db_manager.create_table("test", fields).unwrap();
@@ -302,12 +277,7 @@ fn test_select_with_where() {
     db_manager.use_database("testdb").unwrap();
 
     let fields = vec![
-        CreateTableField::Col(
-            "a".to_string(),
-            ColumnType::Int,
-            true,
-            ParserValue::Null,
-        ),
+        CreateTableField::Col("a".to_string(), ColumnType::Int, true, ParserValue::Null),
         CreateTableField::Col(
             "b".to_string(),
             ColumnType::Char(10),
@@ -320,11 +290,26 @@ fn test_select_with_where() {
 
     // Insert test data
     let rows = vec![
-        vec![ParserValue::Integer(1), ParserValue::String("a".to_string())],
-        vec![ParserValue::Integer(2), ParserValue::String("b".to_string())],
-        vec![ParserValue::Integer(3), ParserValue::String("c".to_string())],
-        vec![ParserValue::Integer(4), ParserValue::String("d".to_string())],
-        vec![ParserValue::Integer(5), ParserValue::String("e".to_string())],
+        vec![
+            ParserValue::Integer(1),
+            ParserValue::String("a".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(2),
+            ParserValue::String("b".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(3),
+            ParserValue::String("c".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(4),
+            ParserValue::String("d".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(5),
+            ParserValue::String("e".to_string()),
+        ],
     ];
     db_manager.insert("test", rows).unwrap();
 
@@ -361,12 +346,7 @@ fn test_select_with_multiple_where() {
     db_manager.use_database("testdb").unwrap();
 
     let fields = vec![
-        CreateTableField::Col(
-            "a".to_string(),
-            ColumnType::Int,
-            true,
-            ParserValue::Null,
-        ),
+        CreateTableField::Col("a".to_string(), ColumnType::Int, true, ParserValue::Null),
         CreateTableField::Col(
             "b".to_string(),
             ColumnType::Char(10),
@@ -378,11 +358,26 @@ fn test_select_with_multiple_where() {
     db_manager.create_table("test", fields).unwrap();
 
     let rows = vec![
-        vec![ParserValue::Integer(1), ParserValue::String("a".to_string())],
-        vec![ParserValue::Integer(2), ParserValue::String("b".to_string())],
-        vec![ParserValue::Integer(3), ParserValue::String("c".to_string())],
-        vec![ParserValue::Integer(4), ParserValue::String("d".to_string())],
-        vec![ParserValue::Integer(5), ParserValue::String("e".to_string())],
+        vec![
+            ParserValue::Integer(1),
+            ParserValue::String("a".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(2),
+            ParserValue::String("b".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(3),
+            ParserValue::String("c".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(4),
+            ParserValue::String("d".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(5),
+            ParserValue::String("e".to_string()),
+        ],
     ];
     db_manager.insert("test", rows).unwrap();
 
@@ -429,12 +424,7 @@ fn test_update() {
     db_manager.use_database("testdb").unwrap();
 
     let fields = vec![
-        CreateTableField::Col(
-            "a".to_string(),
-            ColumnType::Int,
-            true,
-            ParserValue::Null,
-        ),
+        CreateTableField::Col("a".to_string(), ColumnType::Int, true, ParserValue::Null),
         CreateTableField::Col(
             "b".to_string(),
             ColumnType::Char(10),
@@ -446,9 +436,18 @@ fn test_update() {
     db_manager.create_table("test", fields).unwrap();
 
     let rows = vec![
-        vec![ParserValue::Integer(1), ParserValue::String("a".to_string())],
-        vec![ParserValue::Integer(2), ParserValue::String("b".to_string())],
-        vec![ParserValue::Integer(3), ParserValue::String("c".to_string())],
+        vec![
+            ParserValue::Integer(1),
+            ParserValue::String("a".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(2),
+            ParserValue::String("b".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(3),
+            ParserValue::String("c".to_string()),
+        ],
     ];
     db_manager.insert("test", rows).unwrap();
 
@@ -606,24 +605,14 @@ fn test_load_data_infile() {
     db_manager.use_database("testdb").unwrap();
 
     let fields = vec![
-        CreateTableField::Col(
-            "a".to_string(),
-            ColumnType::Int,
-            true,
-            ParserValue::Null,
-        ),
+        CreateTableField::Col("a".to_string(), ColumnType::Int, true, ParserValue::Null),
         CreateTableField::Col(
             "b".to_string(),
             ColumnType::Char(10),
             true,
             ParserValue::Null,
         ),
-        CreateTableField::Col(
-            "c".to_string(),
-            ColumnType::Float,
-            true,
-            ParserValue::Null,
-        ),
+        CreateTableField::Col("c".to_string(), ColumnType::Float, true, ParserValue::Null),
     ];
 
     db_manager.create_table("test", fields).unwrap();
