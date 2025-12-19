@@ -4,6 +4,8 @@ mod error;
 mod index_file;
 mod persistent_btree;
 mod serialization;
+#[cfg(test)]
+mod tests;
 
 pub use error::{IndexError, IndexResult};
 pub use index_file::IndexFile;
@@ -16,9 +18,6 @@ use crate::record::RecordId;
 
 /// High-level index manager
 pub struct IndexManager {
-    /// File manager
-    file_manager: PagedFileManager,
-
     /// Buffer manager
     buffer_manager: BufferManager,
 
@@ -28,9 +27,8 @@ pub struct IndexManager {
 
 impl IndexManager {
     /// Create a new index manager
-    pub fn new(file_manager: PagedFileManager, buffer_manager: BufferManager) -> Self {
+    pub fn new(buffer_manager: BufferManager) -> Self {
         Self {
-            file_manager,
             buffer_manager,
             open_indexes: HashMap::new(),
         }
@@ -45,7 +43,6 @@ impl IndexManager {
     ) -> IndexResult<()> {
         // Use default order optimized for 8KB pages
         let index_file = IndexFile::create(
-            &mut self.file_manager,
             &mut self.buffer_manager,
             db_path,
             table_name,
@@ -98,13 +95,8 @@ impl IndexManager {
             return Ok(());
         }
 
-        let index_file = IndexFile::open(
-            &mut self.file_manager,
-            &mut self.buffer_manager,
-            db_path,
-            table_name,
-            column_name,
-        )?;
+        let index_file =
+            IndexFile::open(&mut self.buffer_manager, db_path, table_name, column_name)?;
 
         self.open_indexes.insert(key, index_file);
 

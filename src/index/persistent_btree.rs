@@ -29,14 +29,13 @@ pub struct PersistentBPlusTree {
 impl PersistentBPlusTree {
     /// Create a new index file
     pub fn create(
-        file_manager: &mut PagedFileManager,
         buffer_mgr: &mut BufferManager,
         path: &str,
         order: usize,
     ) -> IndexResult<Self> {
         // Create the file
-        file_manager.create_file(path)?;
-        let file_handle = file_manager.open_file(path)?;
+        buffer_mgr.file_manager_mut().create_file(path)?;
+        let file_handle = buffer_mgr.file_manager_mut().open_file(path)?;
 
         // Create empty tree
         let tree = BPlusTree::new(order)?;
@@ -65,12 +64,11 @@ impl PersistentBPlusTree {
 
     /// Open an existing index file
     pub fn open(
-        file_manager: &mut PagedFileManager,
         buffer_mgr: &mut BufferManager,
         path: &str,
     ) -> IndexResult<Self> {
         // Open the file
-        let file_handle = file_manager.open_file(path)?;
+        let file_handle = buffer_mgr.file_manager_mut().open_file(path)?;
 
         // Read metadata from page 0
         let metadata_bytes = buffer_mgr.get_page(file_handle, 0)?;

@@ -19,7 +19,6 @@ pub struct IndexFile {
 impl IndexFile {
     /// Create a new index file
     pub fn create(
-        file_manager: &mut PagedFileManager,
         buffer_mgr: &mut BufferManager,
         db_path: &str,
         table_name: &str,
@@ -33,7 +32,7 @@ impl IndexFile {
             return Err(IndexError::IndexAlreadyExists(file_path));
         }
 
-        let btree = PersistentBPlusTree::create(file_manager, buffer_mgr, &file_path, order)?;
+        let btree = PersistentBPlusTree::create(buffer_mgr, &file_path, order)?;
 
         Ok(Self {
             btree,
@@ -44,7 +43,6 @@ impl IndexFile {
 
     /// Open an existing index file
     pub fn open(
-        file_manager: &mut PagedFileManager,
         buffer_mgr: &mut BufferManager,
         db_path: &str,
         table_name: &str,
@@ -57,7 +55,7 @@ impl IndexFile {
             return Err(IndexError::IndexNotFound(file_path));
         }
 
-        let btree = PersistentBPlusTree::open(file_manager, buffer_mgr, &file_path)?;
+        let btree = PersistentBPlusTree::open(buffer_mgr, &file_path)?;
 
         Ok(Self {
             btree,
