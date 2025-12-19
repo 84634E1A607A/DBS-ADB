@@ -1,13 +1,75 @@
 use adb::database::{DatabaseManager, QueryResult};
 use adb::lexer_parser::{self, Query};
-use std::io::{self, BufRead, Write};
+use clap::Parser;
+use std::fs;
+use std::io::{self, BufRead, BufReader, Write};
+use std::path::Path;
+
+#[derive(Parser, Debug)]
+#[command(name = "adb")]
+#[command(about = "A simple database management system", long_about = None)]
+struct Args {
+    /// Initialize database (delete existing data and exit with code 0)
+    #[arg(long)]
+    init: bool,
+
+    /// Batch processing mode
+    #[arg(short, long)]
+    batch: bool,
+
+    /// Import data from file (must be used with -t/--table)
+    #[arg(short, long, value_name = "PATH")]
+    file: Option<String>,
+
+    /// Target table for data import (must be used with -f/--file)
+    #[arg(short, long, value_name = "TABLE")]
+    table: Option<String>,
+
+    /// Database to use at startup (executes USE <db>)
+    #[arg(short, long, value_name = "DB")]
+    database: Option<String>,
+
+    /// Data directory path
+    #[arg(long, default_value = "./data")]
+    data_dir: String,
+}
 
 fn main() {
-    let data_dir = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "./data".to_string());
+    let args = Args::parse();
 
-    let mut db_manager = match DatabaseManager::new(&data_dir) {
+    // Validate argument combinations
+    if args.file.is_some() && args.table.is_none() {
+        eprintln!("Error: -f/--file requires -t/--table to be specified");
+        std::process::exit(1);
+    }
+    if args.table.is_some() && args.file.is_none() {
+        eprintln!("Error: -t/--table requires -f/--file to be specified");
+        std::process::exit(1);
+    }
+
+    // Handle --init: delete existing data and initialize
+    if args.init {
+        if Path::new(&args.data_dir).exists() {
+            if let Err(e) = fs::remove_dir_all(&args.data_dir) {
+                eprintln!("Failed to remove existing data directory: {}", e);
+                std::process::exit(1);
+            }
+        }
+
+        match DatabaseManager::new(&args.data_dir) {
+            Ok(_) => {
+                println!("Database initialized at: {}", args.data_dir);
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("Failed to initialize database manager: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Initialize database manager
+    let mut db_manager = match DatabaseManager::new(&args.data_dir) {
         Ok(manager) => manager,
         Err(e) => {
             eprintln!("Failed to initialize database manager: {}", e);
@@ -15,6 +77,76 @@ fn main() {
         }
     };
 
+    // If database is specified, execute USE command
+    if let Some(db_name) = args.database {
+        let use_query = format!("USE {};", db_name);
+        if let Err(e) = execute_sql_line(&mut db_manager, &use_query, args.batch) {
+            eprintln!("Failed to use database {}: {}", db_name, e);
+            std::process::exit(1);
+        }
+    }
+
+    // Handle file import mode
+    if let (Some(file_path), Some(table_name)) = (args.file, args.table) {
+        if let Err(e) = import_data_from_file(&mut db_manager, &file_path, &table_name, args.batch)
+        {
+            eprintln!("Failed to import data: {}", e);
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
+    // Interactive or batch mode
+    run_interactive_mode(&mut db_manager, args.batch);
+}
+
+fn import_data_from_file(
+    db_manager: &mut DatabaseManager,
+    file_path: &str,
+    _table_name: &str,
+    batch_mode: bool,
+) -> Result<(), String> {
+    let file = fs::File::open(file_path).map_err(|e| format!("Cannot open file: {}", e))?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("Failed to read line: {}", e))?;
+        let line = line.trim();
+
+        if line.is_empty() {
+            continue;
+        }
+
+        // Parse and execute the SQL statement
+        if let Err(e) = execute_sql_line(db_manager, line, batch_mode) {
+            return Err(format!("Error executing '{}': {}", line, e));
+        }
+    }
+
+    Ok(())
+}
+
+fn execute_sql_line(
+    db_manager: &mut DatabaseManager,
+    line: &str,
+    batch_mode: bool,
+) -> Result<(), String> {
+    let queries = lexer_parser::parse(line).map_err(|e| format!("Parse error: {}", e))?;
+
+    for query in queries {
+        if !batch_mode {
+            print_query_echo(line, &query);
+        }
+
+        let result = execute_query(db_manager, query).map_err(|e| format!("{}", e))?;
+
+        print_result(&result);
+    }
+
+    Ok(())
+}
+
+fn run_interactive_mode(db_manager: &mut DatabaseManager, batch_mode: bool) {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -40,10 +172,12 @@ fn main() {
 
         // Execute each query
         for query in queries {
-            // Echo the query type
-            print_query_echo(line, &query);
+            // Echo the query (unless in batch mode)
+            if !batch_mode {
+                print_query_echo(line, &query);
+            }
 
-            let result = execute_query(&mut db_manager, query);
+            let result = execute_query(db_manager, query);
             match result {
                 Ok(res) => print_result(&res),
                 Err(e) => eprintln!("Error: {}", e),
@@ -54,10 +188,7 @@ fn main() {
     }
 }
 
-fn print_query_echo(original: &str, query: &Query) {
-    // Print original query as comment
-    println!("@{}", original);
-}
+fn print_query_echo(original: &str, _query: &Query) {}
 
 fn execute_query(
     db: &mut DatabaseManager,
