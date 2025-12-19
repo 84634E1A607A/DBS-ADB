@@ -20,6 +20,12 @@ use crate::record::RecordId;
 /// Key type for B+ tree (i64 for INT columns)
 pub type BPlusKey = i64;
 
+/// Default B+ tree order optimized for 8KB pages
+/// - Leaf node: 499 entries (order - 1) = 499 * 16 bytes + 16 byte header = 8000 bytes
+/// - Internal node: 500 children = 500 * 12 bytes + 16 byte header = 6016 bytes
+/// This ensures one node fits comfortably in one 8KB page
+pub const DEFAULT_ORDER: usize = 500;
+
 /// B+ Tree data structure
 ///
 /// Order `m` means:
@@ -72,9 +78,9 @@ impl BPlusTree {
         })
     }
 
-    /// Create a new B+ tree with default order (4)
+    /// Create a new B+ tree with default order (500, optimized for 8KB pages)
     pub fn default_order() -> Self {
-        Self::new(4).expect("Order 4 is valid")
+        Self::new(DEFAULT_ORDER).expect("Default order is valid")
     }
 
     /// Get the tree order
@@ -148,14 +154,29 @@ impl BPlusTree {
         }
     }
 
-    /// Get a reference to a node by ID
-    fn get_node(&self, id: NodeId) -> Option<&BPlusNode> {
+    /// Get a reference to a node by ID (public for index layer)
+    pub fn get_node(&self, id: NodeId) -> Option<&BPlusNode> {
         self.nodes.get(id).and_then(|n| n.as_ref())
     }
 
     /// Get a mutable reference to a node by ID
     fn get_node_mut(&mut self, id: NodeId) -> Option<&mut BPlusNode> {
         self.nodes.get_mut(id).and_then(|n| n.as_mut())
+    }
+
+    /// Get the root node ID
+    pub fn root_node_id(&self) -> Option<NodeId> {
+        self.root
+    }
+
+    /// Get the first leaf node ID
+    pub fn first_leaf_id(&self) -> Option<NodeId> {
+        self.first_leaf
+    }
+
+    /// Get the total number of nodes
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
     }
 
     /// Free a node, adding it to the free list

@@ -1,0 +1,275 @@
+//! Index management module
+
+mod error;
+mod index_file;
+mod persistent_btree;
+mod serialization;
+
+pub use error::{IndexError, IndexResult};
+pub use index_file::IndexFile;
+
+use std::collections::HashMap;
+
+use crate::btree::DEFAULT_ORDER;
+use crate::file::{BufferManager, PagedFileManager};
+use crate::record::RecordId;
+
+/// High-level index manager
+pub struct IndexManager {
+    /// File manager
+    file_manager: PagedFileManager,
+
+    /// Buffer manager
+    buffer_manager: BufferManager,
+
+    /// Open indexes: (table_name, column_name) -> IndexFile
+    open_indexes: HashMap<(String, String), IndexFile>,
+}
+
+impl IndexManager {
+    /// Create a new index manager
+    pub fn new(file_manager: PagedFileManager, buffer_manager: BufferManager) -> Self {
+        Self {
+            file_manager,
+            buffer_manager,
+            open_indexes: HashMap::new(),
+        }
+    }
+
+    /// Create a new index
+    pub fn create_index(
+        &mut self,
+        db_path: &str,
+        table_name: &str,
+        column_name: &str,
+    ) -> IndexResult<()> {
+        // Use default order optimized for 8KB pages
+        let index_file = IndexFile::create(
+            &mut self.file_manager,
+            &mut self.buffer_manager,
+            db_path,
+            table_name,
+            column_name,
+            DEFAULT_ORDER,
+        )?;
+
+        // Store in open indexes
+        self.open_indexes.insert(
+            (table_name.to_string(), column_name.to_string()),
+            index_file,
+        );
+
+        Ok(())
+    }
+
+    /// Drop an index
+    pub fn drop_index(
+        &mut self,
+        db_path: &str,
+        table_name: &str,
+        column_name: &str,
+    ) -> IndexResult<()> {
+        // Close the index if open
+        let key = (table_name.to_string(), column_name.to_string());
+        if let Some(index_file) = self.open_indexes.remove(&key) {
+            index_file.close(&mut self.buffer_manager)?;
+        }
+
+        // Delete the file
+        let file_path = format!("{}/{}_{}.idx", db_path, table_name, column_name);
+        std::fs::remove_file(&file_path).map_err(|e| {
+            IndexError::SerializationError(format!("Failed to delete index file: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    /// Open an index
+    pub fn open_index(
+        &mut self,
+        db_path: &str,
+        table_name: &str,
+        column_name: &str,
+    ) -> IndexResult<()> {
+        let key = (table_name.to_string(), column_name.to_string());
+
+        // Don't open if already open
+        if self.open_indexes.contains_key(&key) {
+            return Ok(());
+        }
+
+        let index_file = IndexFile::open(
+            &mut self.file_manager,
+            &mut self.buffer_manager,
+            db_path,
+            table_name,
+            column_name,
+        )?;
+
+        self.open_indexes.insert(key, index_file);
+
+        Ok(())
+    }
+
+    /// Close an index
+    pub fn close_index(&mut self, table_name: &str, column_name: &str) -> IndexResult<()> {
+        let key = (table_name.to_string(), column_name.to_string());
+
+        if let Some(index_file) = self.open_indexes.remove(&key) {
+            index_file.close(&mut self.buffer_manager)?;
+        }
+
+        Ok(())
+    }
+
+    /// Close all indexes
+    pub fn close_all(&mut self) -> IndexResult<()> {
+        let keys: Vec<_> = self.open_indexes.keys().cloned().collect();
+
+        for (table_name, column_name) in keys {
+            self.close_index(&table_name, &column_name)?;
+        }
+
+        Ok(())
+    }
+
+    /// Flush an index to disk
+    pub fn flush_index(&mut self, table_name: &str, column_name: &str) -> IndexResult<()> {
+        let key = (table_name.to_string(), column_name.to_string());
+
+        if let Some(index_file) = self.open_indexes.get_mut(&key) {
+            index_file.flush(&mut self.buffer_manager)?;
+        }
+
+        Ok(())
+    }
+
+    /// Flush all indexes to disk
+    pub fn flush_all(&mut self) -> IndexResult<()> {
+        for index_file in self.open_indexes.values_mut() {
+            index_file.flush(&mut self.buffer_manager)?;
+        }
+
+        Ok(())
+    }
+
+    /// Get a reference to an open index
+    pub fn get_index(&self, table_name: &str, column_name: &str) -> Option<&IndexFile> {
+        let key = (table_name.to_string(), column_name.to_string());
+        self.open_indexes.get(&key)
+    }
+
+    /// Get a mutable reference to an open index
+    pub fn get_index_mut(&mut self, table_name: &str, column_name: &str) -> Option<&mut IndexFile> {
+        let key = (table_name.to_string(), column_name.to_string());
+        self.open_indexes.get_mut(&key)
+    }
+
+    /// Insert into index
+    pub fn insert(
+        &mut self,
+        table_name: &str,
+        column_name: &str,
+        key: i64,
+        rid: RecordId,
+    ) -> IndexResult<()> {
+        let index_key = (table_name.to_string(), column_name.to_string());
+
+        let index_file = self
+            .open_indexes
+            .get_mut(&index_key)
+            .ok_or_else(|| IndexError::IndexNotOpen(format!("{}_{}", table_name, column_name)))?;
+
+        index_file.insert(key, rid)
+    }
+
+    /// Delete from index
+    /// Returns whether any entries were deleted
+    pub fn delete(&mut self, table_name: &str, column_name: &str, key: i64) -> IndexResult<bool> {
+        let index_key = (table_name.to_string(), column_name.to_string());
+
+        let index_file = self
+            .open_indexes
+            .get_mut(&index_key)
+            .ok_or_else(|| IndexError::IndexNotOpen(format!("{}_{}", table_name, column_name)))?;
+
+        index_file.delete(key)
+    }
+
+    /// Delete specific entry from index
+    pub fn delete_entry(
+        &mut self,
+        table_name: &str,
+        column_name: &str,
+        key: i64,
+        rid: RecordId,
+    ) -> IndexResult<bool> {
+        let index_key = (table_name.to_string(), column_name.to_string());
+
+        let index_file = self
+            .open_indexes
+            .get_mut(&index_key)
+            .ok_or_else(|| IndexError::IndexNotOpen(format!("{}_{}", table_name, column_name)))?;
+
+        index_file.delete_entry(key, rid)
+    }
+
+    /// Search index
+    pub fn search(&self, table_name: &str, column_name: &str, key: i64) -> Option<RecordId> {
+        let index_key = (table_name.to_string(), column_name.to_string());
+        self.open_indexes
+            .get(&index_key)
+            .and_then(|index| index.search(key))
+    }
+
+    /// Search all matching entries in index
+    pub fn search_all(&self, table_name: &str, column_name: &str, key: i64) -> Vec<RecordId> {
+        let index_key = (table_name.to_string(), column_name.to_string());
+        self.open_indexes
+            .get(&index_key)
+            .map(|index| index.search_all(key))
+            .unwrap_or_default()
+    }
+
+    /// Range search index
+    pub fn range_search(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        lower: i64,
+        upper: i64,
+    ) -> Vec<(i64, RecordId)> {
+        let index_key = (table_name.to_string(), column_name.to_string());
+        self.open_indexes
+            .get(&index_key)
+            .map(|index| index.range_search(lower, upper))
+            .unwrap_or_default()
+    }
+
+    /// Update entry in index
+    pub fn update(
+        &mut self,
+        table_name: &str,
+        column_name: &str,
+        old_key: i64,
+        old_value: RecordId,
+        new_key: i64,
+        new_value: RecordId,
+    ) -> IndexResult<()> {
+        let index_key = (table_name.to_string(), column_name.to_string());
+
+        let index_file = self
+            .open_indexes
+            .get_mut(&index_key)
+            .ok_or_else(|| IndexError::IndexNotOpen(format!("{}_{}", table_name, column_name)))?;
+
+        index_file.update(old_key, old_value, new_key, new_value)
+    }
+}
+
+impl Drop for IndexManager {
+    fn drop(&mut self) {
+        // Try to close all indexes cleanly
+        let _ = self.close_all();
+    }
+}
