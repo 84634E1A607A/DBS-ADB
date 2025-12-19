@@ -2,10 +2,10 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::btree::DEFAULT_ORDER;
     use crate::file::{BufferManager, PagedFileManager};
     use crate::index::IndexManager;
     use crate::record::RecordId;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     #[test]
@@ -14,7 +14,7 @@ mod tests {
         let db_path = temp_dir.path().to_str().unwrap();
 
         let file_manager = PagedFileManager::new();
-        let buffer_mgr = BufferManager::new(file_manager);
+        let buffer_mgr = Arc::new(Mutex::new(BufferManager::new(file_manager)));
         let mut manager = IndexManager::new(buffer_mgr);
 
         // Create an index
@@ -76,7 +76,7 @@ mod tests {
         // First session: create and insert
         {
             let file_manager = PagedFileManager::new();
-            let buffer_mgr = BufferManager::new(file_manager);
+            let buffer_mgr = Arc::new(Mutex::new(BufferManager::new(file_manager)));
             let mut manager = IndexManager::new(buffer_mgr);
 
             manager.create_index(db_path, "test", "col").unwrap();
@@ -101,7 +101,7 @@ mod tests {
         // Second session: reopen and verify
         {
             let file_manager = PagedFileManager::new();
-            let buffer_mgr = BufferManager::new(file_manager);
+            let buffer_mgr = Arc::new(Mutex::new(BufferManager::new(file_manager)));
             let mut manager = IndexManager::new(buffer_mgr);
 
             manager.open_index(db_path, "test", "col").unwrap();
@@ -124,7 +124,7 @@ mod tests {
         let db_path = temp_dir.path().to_str().unwrap();
 
         let file_manager = PagedFileManager::new();
-        let buffer_mgr = BufferManager::new(file_manager);
+        let buffer_mgr = Arc::new(Mutex::new(BufferManager::new(file_manager)));
         let mut manager = IndexManager::new(buffer_mgr);
 
         manager.create_index(db_path, "test", "col").unwrap();
@@ -158,7 +158,7 @@ mod tests {
         let db_path = temp_dir.path().to_str().unwrap();
 
         let file_manager = PagedFileManager::new();
-        let buffer_mgr = BufferManager::new(file_manager);
+        let buffer_mgr = Arc::new(Mutex::new(BufferManager::new(file_manager)));
         let mut manager = IndexManager::new(buffer_mgr);
 
         manager.create_index(db_path, "test", "col").unwrap();
@@ -196,7 +196,7 @@ mod tests {
         let db_path = temp_dir.path().to_str().unwrap();
 
         let file_manager = PagedFileManager::new();
-        let buffer_mgr = BufferManager::new(file_manager);
+        let buffer_mgr = Arc::new(Mutex::new(BufferManager::new(file_manager)));
         let mut manager = IndexManager::new(buffer_mgr);
 
         manager.create_index(db_path, "test", "col").unwrap();
@@ -247,7 +247,7 @@ mod tests {
         let db_path = temp_dir.path().to_str().unwrap();
 
         let file_manager = PagedFileManager::new();
-        let buffer_mgr = BufferManager::new(file_manager);
+        let buffer_mgr = Arc::new(Mutex::new(BufferManager::new(file_manager)));
         let mut manager = IndexManager::new(buffer_mgr);
 
         manager.create_index(db_path, "test", "col").unwrap();

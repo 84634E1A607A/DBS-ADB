@@ -294,8 +294,7 @@ impl DatabaseManager {
             }
 
             let record = Record::new(record_values);
-            self.record_manager
-                .insert(&table_path.to_string_lossy(), record)?;
+            self.record_manager.insert(table, record)?;
             inserted += 1;
         }
 
@@ -319,7 +318,7 @@ impl DatabaseManager {
         let table_path = self.table_path(db_name, table);
 
         // Scan and find matching records
-        let records = self.record_manager.scan(&table_path.to_string_lossy())?;
+        let records = self.record_manager.scan(table)?;
 
         let mut deleted = 0;
         for (rid, record) in records {
@@ -329,8 +328,7 @@ impl DatabaseManager {
             };
 
             if should_delete {
-                self.record_manager
-                    .delete(&table_path.to_string_lossy(), rid)?;
+                self.record_manager.delete(table, rid)?;
                 deleted += 1;
             }
         }
@@ -369,7 +367,7 @@ impl DatabaseManager {
         }
 
         // Scan and update matching records
-        let records = self.record_manager.scan(&table_path.to_string_lossy())?;
+        let records = self.record_manager.scan(table)?;
 
         let mut updated = 0;
         for (rid, mut record) in records {
@@ -386,8 +384,7 @@ impl DatabaseManager {
                     record.set(*col_idx, record_value);
                 }
 
-                self.record_manager
-                    .update(&table_path.to_string_lossy(), rid, record)?;
+                self.record_manager.update(table, rid, record)?;
                 updated += 1;
             }
         }
@@ -454,7 +451,7 @@ impl DatabaseManager {
             .collect::<Result<Vec<_>, _>>()?;
 
         // Scan table
-        let records = self.record_manager.scan(&table_path.to_string_lossy())?;
+        let records = self.record_manager.scan(table_name)?;
 
         let mut result_rows = Vec::new();
         for (_rid, record) in records {
@@ -759,3 +756,6 @@ pub enum QueryResult {
     List(Vec<String>),
     TableDescription(TableMetadata),
 }
+
+#[cfg(test)]
+mod tests;
