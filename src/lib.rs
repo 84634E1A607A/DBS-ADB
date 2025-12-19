@@ -1,4 +1,6 @@
 pub mod btree;
+pub mod catalog;
+pub mod database;
 pub mod file;
 pub mod index;
 pub mod lexer_parser;

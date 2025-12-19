@@ -11,6 +11,7 @@ pub use error::{IndexError, IndexResult};
 pub use index_file::IndexFile;
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::btree::DEFAULT_ORDER;
 use crate::file::{BufferManager, PagedFileManager};
@@ -19,7 +20,7 @@ use crate::record::RecordId;
 /// High-level index manager
 pub struct IndexManager {
     /// Buffer manager
-    buffer_manager: BufferManager,
+    buffer_manager: Arc<Mutex<BufferManager>>,
 
     /// Open indexes: (table_name, column_name) -> IndexFile
     open_indexes: HashMap<(String, String), IndexFile>,
@@ -27,7 +28,7 @@ pub struct IndexManager {
 
 impl IndexManager {
     /// Create a new index manager
-    pub fn new(buffer_manager: BufferManager) -> Self {
+    pub fn new(buffer_manager: Arc<Mutex<BufferManager>>) -> Self {
         Self {
             buffer_manager,
             open_indexes: HashMap::new(),
@@ -42,13 +43,15 @@ impl IndexManager {
         column_name: &str,
     ) -> IndexResult<()> {
         // Use default order optimized for 8KB pages
+        let mut buffer_manager = self.buffer_manager.lock().unwrap();
         let index_file = IndexFile::create(
-            &mut self.buffer_manager,
+            &mut *buffer_manager,
             db_path,
             table_name,
             column_name,
             DEFAULT_ORDER,
         )?;
+        drop(buffer_manager);
 
         // Store in open indexes
         self.open_indexes.insert(
@@ -69,7 +72,8 @@ impl IndexManager {
         // Close the index if open
         let key = (table_name.to_string(), column_name.to_string());
         if let Some(index_file) = self.open_indexes.remove(&key) {
-            index_file.close(&mut self.buffer_manager)?;
+            let mut buffer_manager = self.buffer_manager.lock().unwrap();
+            index_file.close(&mut *buffer_manager)?;
         }
 
         // Delete the file
@@ -95,8 +99,9 @@ impl IndexManager {
             return Ok(());
         }
 
-        let index_file =
-            IndexFile::open(&mut self.buffer_manager, db_path, table_name, column_name)?;
+        let mut buffer_manager = self.buffer_manager.lock().unwrap();
+        let index_file = IndexFile::open(&mut *buffer_manager, db_path, table_name, column_name)?;
+        drop(buffer_manager);
 
         self.open_indexes.insert(key, index_file);
 
@@ -108,7 +113,8 @@ impl IndexManager {
         let key = (table_name.to_string(), column_name.to_string());
 
         if let Some(index_file) = self.open_indexes.remove(&key) {
-            index_file.close(&mut self.buffer_manager)?;
+            let mut buffer_manager = self.buffer_manager.lock().unwrap();
+            index_file.close(&mut *buffer_manager)?;
         }
 
         Ok(())
@@ -130,7 +136,8 @@ impl IndexManager {
         let key = (table_name.to_string(), column_name.to_string());
 
         if let Some(index_file) = self.open_indexes.get_mut(&key) {
-            index_file.flush(&mut self.buffer_manager)?;
+            let mut buffer_manager = self.buffer_manager.lock().unwrap();
+            index_file.flush(&mut *buffer_manager)?;
         }
 
         Ok(())
@@ -138,8 +145,9 @@ impl IndexManager {
 
     /// Flush all indexes to disk
     pub fn flush_all(&mut self) -> IndexResult<()> {
+        let mut buffer_manager = self.buffer_manager.lock().unwrap();
         for index_file in self.open_indexes.values_mut() {
-            index_file.flush(&mut self.buffer_manager)?;
+            index_file.flush(&mut *buffer_manager)?;
         }
 
         Ok(())

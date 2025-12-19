@@ -30,8 +30,8 @@ impl ColumnDef {
 /// Table schema with all column definitions
 #[derive(Debug, Clone)]
 pub struct TableSchema {
-    table_name: String,
-    columns: Vec<ColumnDef>,
+    pub table_name: String,
+    pub columns: Vec<ColumnDef>,
     null_bitmap_size: usize,
     record_size: usize,
 }

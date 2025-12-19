@@ -2,7 +2,10 @@ mod lexer;
 mod parser;
 
 use lexer::{KeywordEnum, SQLToken, lexer};
-pub use parser::{AlterStatement, ColumnType, DBStatement, Query, Value, parser};
+pub use parser::{
+    AlterStatement, ColumnType, CreateTableField, DBStatement, Expression, Operator, Query,
+    SelectClause, Selector, Selectors, TableColumn, TableStatement, Value, WhereClause, parser,
+};
 
 use chumsky::Parser;
 
