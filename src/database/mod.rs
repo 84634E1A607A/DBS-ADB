@@ -1,3 +1,4 @@
+use csv::ReaderBuilder;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -557,14 +558,23 @@ impl DatabaseManager {
         table: &str,
         delimiter: char,
     ) -> DatabaseResult<usize> {
-        let content = fs::read_to_string(file_path)?;
+        // Use csv crate for efficient parsing
+        let mut reader = ReaderBuilder::new()
+            .delimiter(delimiter as u8)
+            .has_headers(false)
+            .flexible(true) // Allow varying number of fields per row
+            .from_path(file_path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
         let mut rows = Vec::new();
 
-        for line in content.lines() {
-            let fields: Vec<&str> = line.split(delimiter).collect();
-            let mut values = Vec::new();
+        // Process records in batches for better performance
+        for result in reader.records() {
+            let record =
+                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-            for field in fields {
+            let mut values = Vec::new();
+            for field in record.iter() {
                 let field = field.trim();
                 // Try to parse as different types
                 if let Ok(i) = field.parse::<i64>() {
