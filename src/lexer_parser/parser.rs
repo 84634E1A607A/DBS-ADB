@@ -366,13 +366,16 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
 
     fn table_statement<'a>()
     -> impl Parser<'a, &'a [T<'a>], TableStatement, extra::Err<Rich<'a, T<'a>>>> {
+        // Match multi-character operators before single-character ones to avoid
+        // prematurely consuming '>' or '<' and leaving a trailing '=' that
+        // causes a parse error on expressions like ">= 0".
         let operator = choice((
-            just(T::Symbol('=')).to(Operator::Eq),
-            just([T::Symbol('<'), T::Symbol('>')]).to(Operator::Ne),
-            just(T::Symbol('>')).to(Operator::Gt),
-            just(T::Symbol('<')).to(Operator::Lt),
             just([T::Symbol('>'), T::Symbol('=')]).to(Operator::Ge),
             just([T::Symbol('<'), T::Symbol('=')]).to(Operator::Le),
+            just([T::Symbol('<'), T::Symbol('>')]).to(Operator::Ne),
+            just(T::Symbol('=')).to(Operator::Eq),
+            just(T::Symbol('>')).to(Operator::Gt),
+            just(T::Symbol('<')).to(Operator::Lt),
         ))
         .boxed();
 
