@@ -1,5 +1,5 @@
 use csv::ReaderBuilder;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -271,6 +271,25 @@ impl DatabaseManager {
 
     // Data operations
     pub fn insert(&mut self, table: &str, rows: Vec<Vec<ParserValue>>) -> DatabaseResult<usize> {
+        self.bulk_insert(table, rows, false)
+    }
+
+    /// Optimized bulk insert function
+    ///
+    /// This function provides significant performance improvements for bulk inserts by:
+    /// 1. Checking for primary key duplicates within the batch itself using a HashSet (O(n) instead of O(n²))
+    /// 2. Using B-tree index lookups for single-column integer primary keys (O(log n) per lookup)
+    /// 3. Scanning the table only once for all rows instead of once per row
+    /// 4. Optionally skipping primary key checks when data is known to be valid (e.g., from LOAD DATA INFILE)
+    ///
+    /// When skip_pk_check is true, primary key checking is skipped entirely for maximum performance.
+    /// Use this only when data is known to be valid and without duplicates.
+    pub fn bulk_insert(
+        &mut self,
+        table: &str,
+        rows: Vec<Vec<ParserValue>>,
+        skip_pk_check: bool,
+    ) -> DatabaseResult<usize> {
         let (table_meta, schema) = {
             let metadata = self
                 .current_metadata
@@ -291,7 +310,23 @@ impl DatabaseManager {
             .record_manager
             .open_table(&table_path_str, schema.clone());
 
-        let mut inserted = 0;
+        // For primary key checking, collect all keys in the batch first
+        let mut batch_pk_set = HashSet::new();
+        let pk_indices: Option<Vec<usize>> = table_meta.primary_key.as_ref().map(|pk_cols| {
+            pk_cols
+                .iter()
+                .map(|col_name| {
+                    table_meta
+                        .columns
+                        .iter()
+                        .position(|c| &c.name == col_name)
+                        .unwrap()
+                })
+                .collect()
+        });
+
+        // Convert all rows and check for duplicates within batch
+        let mut records = Vec::with_capacity(rows.len());
         for row in rows {
             // Convert parser values to record values
             let mut record_values = Vec::new();
@@ -311,36 +346,100 @@ impl DatabaseManager {
 
             let record = Record::new(record_values);
 
-            // Check PRIMARY KEY constraint
-            if let Some(ref pk_cols) = table_meta.primary_key {
-                // Build primary key value from the record
-                let pk_indices: Vec<usize> = pk_cols
-                    .iter()
-                    .map(|col_name| {
-                        table_meta
-                            .columns
-                            .iter()
-                            .position(|c| &c.name == col_name)
-                            .unwrap()
-                    })
-                    .collect();
+            // Check for duplicates within the batch itself
+            if !skip_pk_check {
+                if let Some(ref indices) = pk_indices {
+                    let pk_key: Vec<String> = indices
+                        .iter()
+                        .map(|&idx| format!("{:?}", record.get(idx).unwrap()))
+                        .collect();
+                    let pk_string = pk_key.join("|");
 
-                // Scan existing records to check for duplicates
-                let existing_records = self.record_manager.scan(table)?;
-                for (_, existing_record) in existing_records {
-                    let mut is_duplicate = true;
-                    for &pk_idx in &pk_indices {
-                        if record.get(pk_idx) != existing_record.get(pk_idx) {
-                            is_duplicate = false;
-                            break;
-                        }
-                    }
-                    if is_duplicate {
+                    if !batch_pk_set.insert(pk_string) {
                         return Err(DatabaseError::PrimaryKeyViolation);
                     }
                 }
             }
 
+            records.push(record);
+        }
+
+        // Check against existing records using index if available (only for single-column integer PKs)
+        if !skip_pk_check {
+            if let Some(ref pk_cols) = table_meta.primary_key {
+                if pk_cols.len() == 1 {
+                    let pk_col_name = &pk_cols[0];
+                    let pk_col_idx = table_meta
+                        .columns
+                        .iter()
+                        .position(|c| &c.name == pk_col_name)
+                        .unwrap();
+
+                    // Try to use index for primary key checking
+                    let db_path = self.data_dir.join(db_name.as_str());
+                    let index_key = (table.to_string(), pk_col_name.clone());
+
+                    // Try to open the index if it exists
+                    let has_index = self
+                        .index_manager
+                        .open_index(&db_path.to_string_lossy(), table, pk_col_name)
+                        .is_ok();
+
+                    if has_index {
+                        // Use index for fast lookup
+                        for record in &records {
+                            if let RecordValue::Int(pk_val) = record.get(pk_col_idx).unwrap() {
+                                if self
+                                    .index_manager
+                                    .search(table, pk_col_name, *pk_val as i64)
+                                    .is_some()
+                                {
+                                    return Err(DatabaseError::PrimaryKeyViolation);
+                                }
+                            }
+                        }
+                    } else {
+                        // Fallback: scan existing records (only once for the whole batch)
+                        let existing_records = self.record_manager.scan(table)?;
+                        for record in &records {
+                            for (_, existing_record) in &existing_records {
+                                let mut is_duplicate = true;
+                                for &pk_idx in pk_indices.as_ref().unwrap() {
+                                    if record.get(pk_idx) != existing_record.get(pk_idx) {
+                                        is_duplicate = false;
+                                        break;
+                                    }
+                                }
+                                if is_duplicate {
+                                    return Err(DatabaseError::PrimaryKeyViolation);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Multi-column PK: use table scan (but only once for the whole batch)
+                    let existing_records = self.record_manager.scan(table)?;
+                    for record in &records {
+                        for (_, existing_record) in &existing_records {
+                            let mut is_duplicate = true;
+                            for &pk_idx in pk_indices.as_ref().unwrap() {
+                                if record.get(pk_idx) != existing_record.get(pk_idx) {
+                                    is_duplicate = false;
+                                    break;
+                                }
+                            }
+                            if is_duplicate {
+                                return Err(DatabaseError::PrimaryKeyViolation);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Insert all records
+        let mut inserted = 0;
+        for record in records {
             self.record_manager.insert(table, record)?;
             inserted += 1;
         }
@@ -570,8 +669,8 @@ impl DatabaseManager {
 
         // Process records in batches for better performance
         for result in reader.records() {
-            let record =
-                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            let record = result
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
             let mut values = Vec::new();
             for field in record.iter() {
@@ -593,7 +692,9 @@ impl DatabaseManager {
             }
         }
 
-        self.insert(table, rows)
+        // Use bulk insert with assumption that data is correct (as per user requirement)
+        // This skips expensive primary key checking for maximum performance
+        self.bulk_insert(table, rows, true)
     }
 
     // Helper methods
