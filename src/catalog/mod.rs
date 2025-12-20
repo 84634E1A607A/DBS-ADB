@@ -28,7 +28,7 @@ pub type CatalogResult<T> = Result<T, CatalogError>;
 pub struct ColumnMetadata {
     pub name: String,
     #[serde(rename = "type")]
-    pub column_type: String, // Store as string for JSON: "INT", "FLOAT", "CHAR(n)"
+    pub column_type: String, // Store as string for JSON: "INT", "FLOAT", "VARCHAR(n)"
     pub not_null: bool,
     pub default_value: Option<String>, // Store as string for JSON
 }
@@ -38,7 +38,7 @@ impl ColumnMetadata {
         let column_type = match ct {
             ColumnType::Int => "INT".to_string(),
             ColumnType::Float => "FLOAT".to_string(),
-            ColumnType::Char(n) => format!("CHAR({})", n),
+            ColumnType::Char(n) => format!("VARCHAR({})", n),
         };
 
         let default_value = match default {
@@ -61,7 +61,13 @@ impl ColumnMetadata {
             DataType::Int
         } else if self.column_type == "FLOAT" {
             DataType::Float
+        } else if self.column_type.starts_with("VARCHAR(") {
+            let size: usize = self.column_type[8..self.column_type.len() - 1]
+                .parse()
+                .unwrap();
+            DataType::Char(size)
         } else if self.column_type.starts_with("CHAR(") {
+            // Backward compatibility for existing metadata
             let size: usize = self.column_type[5..self.column_type.len() - 1]
                 .parse()
                 .unwrap();
