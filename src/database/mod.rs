@@ -730,7 +730,8 @@ impl DatabaseManager {
             }
             DBStatement::ShowTables => {
                 let tables = self.show_tables()?;
-                Ok(QueryResult::List(tables))
+                let rows = tables.into_iter().map(|t| vec![t]).collect();
+                Ok(QueryResult::ResultSet(vec!["TABLES".to_string()], rows))
             }
             DBStatement::ShowIndexes => {
                 // TODO: Implement show indexes
