@@ -147,12 +147,15 @@ impl BufferManager {
     pub fn evict_page(&mut self, file: FileHandle, page_id: PageId) -> FileResult<()> {
         let key = BufferKey { file, page_id };
 
-        // Flush if dirty
-        self.flush_page(file, page_id)?;
+        // Only evict if the page is actually in the buffer
+        if self.buffer_pool.contains_key(&key) {
+            // Flush if dirty
+            self.flush_page(file, page_id)?;
 
-        // Remove from buffer pool and LRU
-        self.buffer_pool.remove(&key);
-        self.lru_cache.pop(&key);
+            // Remove from buffer pool and LRU
+            self.buffer_pool.remove(&key);
+            self.lru_cache.pop(&key);
+        }
 
         Ok(())
     }
@@ -161,8 +164,8 @@ impl BufferManager {
     fn load_page(&mut self, file: FileHandle, page_id: PageId) -> FileResult<()> {
         let key = BufferKey { file, page_id };
 
-        // Check if buffer pool is full
-        if self.buffer_pool.len() >= self.max_pool_size {
+        // Check if buffer pool is full - evict until we have space
+        while self.buffer_pool.len() >= self.max_pool_size {
             self.evict_lru_page()?;
         }
 
@@ -179,7 +182,7 @@ impl BufferManager {
             },
         );
 
-        // Add to LRU cache
+        // Add to LRU cache - this should never evict since we ensured space above
         self.lru_cache.put(key, ());
 
         Ok(())
@@ -187,11 +190,11 @@ impl BufferManager {
 
     /// Evict the least recently used page from the buffer pool
     fn evict_lru_page(&mut self) -> FileResult<()> {
-        // Find the LRU page
-        let lru_key = self.lru_cache.peek_lru().map(|(k, _)| *k);
-
-        if let Some(key) = lru_key {
-            self.evict_page(key.file, key.page_id)?;
+        // Find and remove the LRU page from the LRU cache
+        if let Some((key, _)) = self.lru_cache.pop_lru() {
+            // Flush if dirty and remove from buffer pool
+            self.flush_page(key.file, key.page_id)?;
+            self.buffer_pool.remove(&key);
         }
 
         Ok(())

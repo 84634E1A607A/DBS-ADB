@@ -43,6 +43,11 @@ impl RecordManager {
 
     /// Open an existing table file
     pub fn open_table(&mut self, path: &str, schema: TableSchema) -> RecordResult<()> {
+        // Don't re-open if already open - this would reset page_count!
+        if self.open_tables.contains_key(schema.table_name()) {
+            return Ok(());
+        }
+        
         let mut buffer_manager = self.buffer_manager.lock().unwrap();
         let table_file = TableFile::open(&mut *buffer_manager, path, schema)?;
         drop(buffer_manager);

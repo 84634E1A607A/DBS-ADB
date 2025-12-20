@@ -10,6 +10,7 @@ pub struct TableFile {
     schema: TableSchema,
     first_page_id: PageId,
     page_count: usize,
+    last_insert_page_id: PageId, // Track last page used for insertion to optimize sequential inserts
 }
 
 impl TableFile {
@@ -36,6 +37,7 @@ impl TableFile {
             schema,
             first_page_id: 0,
             page_count: 1,
+            last_insert_page_id: 0,
         })
     }
 
@@ -53,6 +55,7 @@ impl TableFile {
             schema,
             first_page_id: 0,
             page_count: if page_count > 0 { page_count } else { 1 },
+            last_insert_page_id: if page_count > 0 { page_count - 1 } else { 0 },
         })
     }
 
@@ -78,11 +81,13 @@ impl TableFile {
         // Serialize record
         let record_bytes = record.serialize(&self.schema)?;
 
-        // Find a page with free space
-        let mut page_id = self.first_page_id;
+        // Start search from last insertion point (optimization for sequential inserts)
+        let mut page_id = self.last_insert_page_id;
+        let mut checked_from_start = false;
+
         loop {
-            // Load the page
-            let page_buffer = buffer_mgr.get_page(self.file_handle, page_id)?;
+            // Load the page directly as mutable (avoid double load)
+            let page_buffer = buffer_mgr.get_page_mut(self.file_handle, page_id)?;
             let mut page = Page::from_bytes(page_buffer)?;
 
             // Check if page has free space
@@ -91,10 +96,12 @@ impl TableFile {
                 page.set_record(slot_id, &record_bytes)?;
                 page.mark_slot_used(slot_id)?;
 
-                // Write page back
+                // Write page back (buffer is already mutable)
                 let page_bytes = page.to_bytes();
-                let page_buffer = buffer_mgr.get_page_mut(self.file_handle, page_id)?;
                 page_buffer.copy_from_slice(&page_bytes);
+
+                // Update last insert location for next time
+                self.last_insert_page_id = page_id;
 
                 return Ok(RecordId::new(page_id, slot_id));
             }
@@ -102,10 +109,18 @@ impl TableFile {
             // Check if there's a next page
             let next_page = page.next_page();
             if next_page == 0 {
-                // No next page, need to allocate a new one
-                let new_page_id = self.allocate_new_page(buffer_mgr, page_id)?;
-                page_id = new_page_id;
-                // Loop will try again with the new page
+                // No next page
+                if !checked_from_start && page_id != self.first_page_id {
+                    // We started from last_insert_page_id, try from beginning
+                    page_id = self.first_page_id;
+                    checked_from_start = true;
+                } else {
+                    // Need to allocate a new page
+                    let new_page_id = self.allocate_new_page(buffer_mgr, page_id)?;
+                    self.last_insert_page_id = new_page_id;
+                    page_id = new_page_id;
+                    // Loop will try again with the new page
+                }
             } else {
                 page_id = next_page;
             }
@@ -233,13 +248,12 @@ impl TableFile {
         let page_buffer = buffer_mgr.get_page_mut(self.file_handle, new_page_id)?;
         page_buffer.copy_from_slice(&new_page_bytes);
 
-        // Update previous page's next_page pointer
-        let prev_page_buffer = buffer_mgr.get_page(self.file_handle, prev_page_id)?;
+        // Update previous page's next_page pointer (use get_page_mut directly)
+        let prev_page_buffer = buffer_mgr.get_page_mut(self.file_handle, prev_page_id)?;
         let mut prev_page = Page::from_bytes(prev_page_buffer)?;
         prev_page.set_next_page(new_page_id);
 
         let prev_page_bytes = prev_page.to_bytes();
-        let prev_page_buffer = buffer_mgr.get_page_mut(self.file_handle, prev_page_id)?;
         prev_page_buffer.copy_from_slice(&prev_page_bytes);
 
         Ok(new_page_id)
