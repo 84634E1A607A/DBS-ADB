@@ -161,6 +161,11 @@ fn run_interactive_mode(db_manager: &mut DatabaseManager, batch_mode: bool) {
             continue;
         }
 
+        // Check for exit command
+        if line.eq_ignore_ascii_case("exit") {
+            break;
+        }
+
         // Parse SQL
         let queries = match lexer_parser::parse(line) {
             Ok(q) => q,
