@@ -50,7 +50,7 @@ pub enum DatabaseError {
     #[error("Index error: {0}")]
     IndexError(#[from] crate::index::IndexError),
 
-    #[error("Primary key violation")]
+    #[error("Primary key violation: duplicate key value")]
     PrimaryKeyViolation,
 
     #[error("Foreign key violation")]
@@ -309,6 +309,37 @@ impl DatabaseManager {
             }
 
             let record = Record::new(record_values);
+
+            // Check PRIMARY KEY constraint
+            if let Some(ref pk_cols) = table_meta.primary_key {
+                // Build primary key value from the record
+                let pk_indices: Vec<usize> = pk_cols
+                    .iter()
+                    .map(|col_name| {
+                        table_meta
+                            .columns
+                            .iter()
+                            .position(|c| &c.name == col_name)
+                            .unwrap()
+                    })
+                    .collect();
+
+                // Scan existing records to check for duplicates
+                let existing_records = self.record_manager.scan(table)?;
+                for (_, existing_record) in existing_records {
+                    let mut is_duplicate = true;
+                    for &pk_idx in &pk_indices {
+                        if record.get(pk_idx) != existing_record.get(pk_idx) {
+                            is_duplicate = false;
+                            break;
+                        }
+                    }
+                    if is_duplicate {
+                        return Err(DatabaseError::PrimaryKeyViolation);
+                    }
+                }
+            }
+
             self.record_manager.insert(table, record)?;
             inserted += 1;
         }

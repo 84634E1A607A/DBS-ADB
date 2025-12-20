@@ -185,7 +185,13 @@ fn run_interactive_mode(db_manager: &mut DatabaseManager, batch_mode: bool) {
             let result = execute_query(db_manager, query);
             match result {
                 Ok(res) => print_result(&res),
-                Err(e) => eprintln!("Error: {}", e),
+                Err(e) => {
+                    if batch_mode {
+                        println!("!ERROR");
+                    } else {
+                        eprintln!("Error: {}", e);
+                    }
+                }
             }
 
             if batch_mode {
