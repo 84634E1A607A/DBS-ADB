@@ -437,14 +437,9 @@ impl DatabaseManager {
             }
         }
 
-        // Insert all records
-        let mut inserted = 0;
-        for record in records {
-            self.record_manager.insert(table, record)?;
-            inserted += 1;
-        }
-
-        Ok(inserted)
+        // Insert all records in one batch - much faster as it holds the lock only once
+        let _record_ids = self.record_manager.bulk_insert(table, records)?;
+        Ok(_record_ids.len())
     }
 
     pub fn delete(

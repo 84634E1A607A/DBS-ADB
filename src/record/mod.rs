@@ -67,6 +67,30 @@ impl RecordManager {
         table.insert_record(&mut *buffer_manager, &record)
     }
 
+    /// Bulk insert multiple records into a table
+    /// This is much more efficient than calling insert repeatedly as it:
+    /// - Acquires the buffer_manager lock only once
+    /// - Allows the table file to optimize insertions (e.g., fill pages before writing)
+    pub fn bulk_insert(
+        &mut self,
+        table_name: &str,
+        records: Vec<Record>,
+    ) -> RecordResult<Vec<RecordId>> {
+        let mut buffer_manager = self.buffer_manager.lock().unwrap();
+        let table = self
+            .open_tables
+            .get_mut(table_name)
+            .ok_or_else(|| RecordError::TableNotOpen(table_name.to_string()))?;
+
+        let mut record_ids = Vec::with_capacity(records.len());
+        for record in &records {
+            let rid = table.insert_record(&mut *buffer_manager, record)?;
+            record_ids.push(rid);
+        }
+
+        Ok(record_ids)
+    }
+
     /// Delete a record from a table
     pub fn delete(&mut self, table_name: &str, rid: RecordId) -> RecordResult<()> {
         let mut buffer_manager = self.buffer_manager.lock().unwrap();
