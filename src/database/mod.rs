@@ -652,6 +652,15 @@ impl DatabaseManager {
         table: &str,
         delimiter: char,
     ) -> DatabaseResult<usize> {
+        // Get table metadata to know column types
+        let table_meta = {
+            let metadata = self
+                .current_metadata
+                .as_ref()
+                .ok_or(DatabaseError::NoDatabaseSelected)?;
+            metadata.get_table(table)?.clone()
+        };
+
         // Use csv crate for efficient parsing
         let mut reader = ReaderBuilder::new()
             .delimiter(delimiter as u8)
@@ -661,25 +670,42 @@ impl DatabaseManager {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         let mut rows = Vec::new();
+        let num_columns = table_meta.columns.len();
 
-        // Process records in batches for better performance
+        // Process records - use schema to parse types directly instead of guessing
         for result in reader.records() {
             let record = result
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-            let mut values = Vec::new();
-            for field in record.iter() {
-                let field = field.trim();
-                // Try to parse as different types
-                if let Ok(i) = field.parse::<i64>() {
-                    values.push(ParserValue::Integer(i));
-                } else if let Ok(f) = field.parse::<f64>() {
-                    values.push(ParserValue::Float(f));
-                } else if field.eq_ignore_ascii_case("null") {
-                    values.push(ParserValue::Null);
-                } else {
-                    values.push(ParserValue::String(field.to_string()));
+            let mut values = Vec::with_capacity(num_columns);
+            for (idx, field) in record.iter().enumerate() {
+                if idx >= table_meta.columns.len() {
+                    break; // Skip extra fields
                 }
+
+                let col = &table_meta.columns[idx];
+                let field = field.trim();
+
+                // Parse according to the column's data type - much faster than guessing!
+                let value = if field.eq_ignore_ascii_case("null") {
+                    ParserValue::Null
+                } else {
+                    match col.to_data_type() {
+                        crate::record::DataType::Int => {
+                            match field.parse::<i64>() {
+                                Ok(i) => ParserValue::Integer(i),
+                                Err(_) => ParserValue::Null, // Handle parse errors gracefully
+                            }
+                        }
+                        crate::record::DataType::Float => match field.parse::<f64>() {
+                            Ok(f) => ParserValue::Float(f),
+                            Err(_) => ParserValue::Null,
+                        },
+                        crate::record::DataType::Char(_) => ParserValue::String(field.to_string()),
+                    }
+                };
+
+                values.push(value);
             }
 
             if !values.is_empty() {
