@@ -135,7 +135,7 @@ fn execute_sql_line(
 
     for query in queries {
         if !batch_mode {
-            print_query_echo(line, &query);
+            print_query_echo(line);
         }
 
         let result = execute_query(db_manager, query).map_err(|e| format!("{}", e))?;
@@ -174,7 +174,7 @@ fn run_interactive_mode(db_manager: &mut DatabaseManager, batch_mode: bool) {
         for query in queries {
             // Echo the query (unless in batch mode)
             if !batch_mode {
-                print_query_echo(line, &query);
+                print_query_echo(line);
             }
 
             let result = execute_query(db_manager, query);
@@ -183,12 +183,19 @@ fn run_interactive_mode(db_manager: &mut DatabaseManager, batch_mode: bool) {
                 Err(e) => eprintln!("Error: {}", e),
             }
 
+            if batch_mode {
+                print_query_echo(line);
+            }
+
             stdout.flush().unwrap();
         }
     }
 }
 
-fn print_query_echo(original: &str, _query: &Query) {}
+fn print_query_echo(_original: &str) {
+    // Print original query as comment
+    println!("@{}", _original);
+}
 
 fn execute_query(
     db: &mut DatabaseManager,
