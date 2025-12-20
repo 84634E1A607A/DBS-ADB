@@ -197,6 +197,15 @@ impl DatabaseManager {
             }
         }
 
+        // Primary key columns are implicitly NOT NULL
+        if let Some(pk_cols) = &primary_key {
+            for col in &mut columns {
+                if pk_cols.contains(&col.name) {
+                    col.not_null = true;
+                }
+            }
+        }
+
         let table_metadata = TableMetadata {
             name: name.to_string(),
             columns,

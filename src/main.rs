@@ -247,6 +247,27 @@ fn print_result(result: &QueryResult) {
                     col.name, col.column_type, null_str, default_str
                 );
             }
+
+            // Blank line to separate column definitions from constraints
+            println!();
+
+            if let Some(pk) = &meta.primary_key {
+                println!("PRIMARY KEY ({});", pk.join(", "));
+            }
+
+            for fk in &meta.foreign_keys {
+                println!(
+                    "FOREIGN KEY ({}) REFERENCES {}({});",
+                    fk.columns.join(", "),
+                    fk.ref_table,
+                    fk.ref_columns.join(", ")
+                );
+            }
+
+            for idx in &meta.indexes {
+                // Index name is omitted in expected outputs
+                println!("INDEX ({});", idx.columns.join(", "));
+            }
         }
     }
 }
