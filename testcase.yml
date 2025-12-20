@@ -2,7 +2,10 @@ compile:
   commands: make
 
 run:
-  commands: ["python3", "hello.py"]
+  commands: ["./adb"]
   flags:
-    - no_use
+    - query
+    - data
+    - pk
+    - index
 

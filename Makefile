@@ -1,3 +1,3 @@
 all:
-	@echo "Python project needn't compile"
+	@echo "I am too lazy to create vendor deps, so I just run pre-commit to generate a release binary"
 
