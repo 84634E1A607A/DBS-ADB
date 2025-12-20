@@ -140,6 +140,9 @@ impl BufferManager {
             }
         }
 
+        // Sync all files to ensure data is persisted to disk
+        self.file_manager.sync_all()?;
+
         Ok(())
     }
 

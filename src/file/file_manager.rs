@@ -180,9 +180,18 @@ impl PagedFileManager {
             .ok_or(FileError::InvalidHandle(handle.0))?;
 
         let offset = (page_id * PAGE_SIZE) as u64;
+        let required_size = offset + PAGE_SIZE as u64;
+        
+        // Extend file if necessary to ensure we can write at this offset
+        let current_size = entry.file.metadata()?.len();
+        if current_size < required_size {
+            entry.file.set_len(required_size)?;
+        }
+        
         entry.file.seek(SeekFrom::Start(offset))?;
         entry.file.write_all(buffer)?;
-        entry.file.sync_data()?; // Ensure data is written to disk
+        // Note: Don't sync on every write - let the OS buffer and batch writes
+        // Sync will be called by flush_all() or when buffer manager drops
 
         Ok(())
     }
@@ -197,6 +206,25 @@ impl PagedFileManager {
         let file_size = entry.file.metadata()?.len();
         let page_count = file_size.div_ceil(PAGE_SIZE as u64) as usize;
         Ok(page_count)
+    }
+
+    /// Sync a file to disk (flush all OS buffers)
+    pub fn sync_file(&mut self, handle: FileHandle) -> FileResult<()> {
+        let entry = self
+            .open_files
+            .get_mut(&handle)
+            .ok_or(FileError::InvalidHandle(handle.0))?;
+
+        entry.file.sync_data()?;
+        Ok(())
+    }
+
+    /// Sync all open files to disk
+    pub fn sync_all(&mut self) -> FileResult<()> {
+        for entry in self.open_files.values_mut() {
+            entry.file.sync_data()?;
+        }
+        Ok(())
     }
 
     /// Check if a file is open
