@@ -669,10 +669,13 @@ impl DatabaseManager {
             .from_path(file_path)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-        let mut rows = Vec::new();
         let num_columns = table_meta.columns.len();
+        const BATCH_SIZE: usize = 10000; // Process 10K rows at a time to reduce memory pressure
 
-        // Process records - use schema to parse types directly instead of guessing
+        let mut total_inserted = 0;
+        let mut batch_rows = Vec::with_capacity(BATCH_SIZE);
+
+        // Process records in batches - use schema to parse types directly
         for result in reader.records() {
             let record = result
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
@@ -691,12 +694,10 @@ impl DatabaseManager {
                     ParserValue::Null
                 } else {
                     match col.to_data_type() {
-                        crate::record::DataType::Int => {
-                            match field.parse::<i64>() {
-                                Ok(i) => ParserValue::Integer(i),
-                                Err(_) => ParserValue::Null, // Handle parse errors gracefully
-                            }
-                        }
+                        crate::record::DataType::Int => match field.parse::<i64>() {
+                            Ok(i) => ParserValue::Integer(i),
+                            Err(_) => ParserValue::Null,
+                        },
                         crate::record::DataType::Float => match field.parse::<f64>() {
                             Ok(f) => ParserValue::Float(f),
                             Err(_) => ParserValue::Null,
@@ -709,13 +710,22 @@ impl DatabaseManager {
             }
 
             if !values.is_empty() {
-                rows.push(values);
+                batch_rows.push(values);
+
+                // Insert batch when it reaches BATCH_SIZE
+                if batch_rows.len() >= BATCH_SIZE {
+                    total_inserted += self.bulk_insert(table, batch_rows, true)?;
+                    batch_rows = Vec::with_capacity(BATCH_SIZE); // Reset for next batch
+                }
             }
         }
 
-        // Use bulk insert with assumption that data is correct (as per user requirement)
-        // This skips expensive primary key checking for maximum performance
-        self.bulk_insert(table, rows, true)
+        // Insert remaining rows
+        if !batch_rows.is_empty() {
+            total_inserted += self.bulk_insert(table, batch_rows, true)?;
+        }
+
+        Ok(total_inserted)
     }
 
     // Helper methods
