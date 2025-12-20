@@ -1,4 +1,4 @@
-use adb::database::{DatabaseManager, QueryResult};
+use adb::database::{DatabaseError, DatabaseManager, QueryResult};
 use adb::lexer_parser::{self, Query};
 use clap::Parser;
 use std::fs;
@@ -170,8 +170,12 @@ fn run_interactive_mode(db_manager: &mut DatabaseManager, batch_mode: bool) {
         let queries = match lexer_parser::parse(line) {
             Ok(q) => q,
             Err(e) => {
-                eprintln!("Parse error: {}", e);
-                continue;
+                if batch_mode {
+                    panic!("Parse error: {}", e);
+                } else {
+                    eprintln!("Parse error: {}", e);
+                    continue;
+                }
             }
         };
 
@@ -188,6 +192,11 @@ fn run_interactive_mode(db_manager: &mut DatabaseManager, batch_mode: bool) {
                 Err(e) => {
                     if batch_mode {
                         println!("!ERROR");
+                        // Map long error messages to shorter ones for batch mode
+                        match e {
+                            DatabaseError::PrimaryKeyViolation => println!("duplicate"),
+                            _ => println!("{}", e),
+                        }
                     } else {
                         eprintln!("Error: {}", e);
                     }
