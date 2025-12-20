@@ -721,7 +721,8 @@ impl DatabaseManager {
             }
             DBStatement::ShowDatabases => {
                 let dbs = self.show_databases()?;
-                Ok(QueryResult::List(dbs))
+                let rows = dbs.into_iter().map(|db| vec![db]).collect();
+                Ok(QueryResult::ResultSet(vec!["DATABASES".to_string()], rows))
             }
             DBStatement::UseDatabase(name) => {
                 self.use_database(&name)?;
