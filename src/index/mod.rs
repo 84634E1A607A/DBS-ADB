@@ -10,7 +10,11 @@ mod tests;
 pub use error::{IndexError, IndexResult};
 pub use index_file::IndexFile;
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::btree::DEFAULT_ORDER;
@@ -84,6 +88,20 @@ impl IndexManager {
     /// let table_data: Vec<(RecordId, i64)> = /* scan table */;
     ///
     /// // Create index with automatic sorting and optimal tree construction
+    /// Create an index from table data using external sorting for large datasets
+    ///
+    /// Uses external merge sort to handle datasets larger than available memory.
+    /// Data is sorted in chunks that fit in memory, written to temporary files,
+    /// then merged using k-way merge.
+    ///
+    /// # Arguments
+    /// * `db_path` - Path to the database directory
+    /// * `table_name` - Name of the table
+    /// * `column_name` - Name of the column to index
+    /// * `table_data` - Iterator over (RecordId, value) pairs
+    ///
+    /// # Example
+    /// ```ignore
     /// index_manager.create_index_from_table(
     ///     "/path/to/db",
     ///     "users",
@@ -101,15 +119,104 @@ impl IndexManager {
     where
         I: Iterator<Item = (RecordId, i64)>,
     {
-        // For large datasets, we need to be memory-efficient
-        // Collect entries but with capacity hint to avoid reallocations
-        let mut entries: Vec<(i64, RecordId)> =
-            table_data.map(|(rid, value)| (value, rid)).collect();
+        use std::fs::File;
+        use std::io::{BufRead, BufReader, BufWriter, Write};
+        use std::path::PathBuf;
 
-        let entry_count = entries.len();
+        // Memory limit for external sort: ~150MB for sorting chunks
+        // Each entry is (i64, RecordId) = 8 + 8 = 16 bytes
+        const MEMORY_LIMIT_BYTES: usize = 150 * 1024 * 1024;
+        const ENTRY_SIZE: usize = 16;
+        const CHUNK_SIZE: usize = MEMORY_LIMIT_BYTES / ENTRY_SIZE; // ~9.8M entries per chunk
 
-        // If no entries, just create empty index
-        if entry_count == 0 {
+        // Temporary directory for sorted chunks
+        let temp_dir = PathBuf::from(db_path).join(".tmp_index_sort");
+        std::fs::create_dir_all(&temp_dir).map_err(|e| IndexError::IoError(e.to_string()))?;
+
+        // Phase 1: Split into sorted chunks
+        let mut chunk_files = Vec::new();
+        let mut current_chunk = Vec::with_capacity(CHUNK_SIZE);
+        let mut total_entries = 0;
+
+        eprintln!(
+            "Creating index on {}.{} using external sort...",
+            table_name, column_name
+        );
+
+        for (rid, value) in table_data {
+            current_chunk.push((value, rid));
+            total_entries += 1;
+
+            if current_chunk.len() >= CHUNK_SIZE {
+                // Sort this chunk
+                current_chunk.sort_unstable_by_key(|e| e.0);
+
+                // Write to temporary file
+                let chunk_path = temp_dir.join(format!("chunk_{}.dat", chunk_files.len()));
+                let file =
+                    File::create(&chunk_path).map_err(|e| IndexError::IoError(e.to_string()))?;
+                let mut writer = BufWriter::new(file);
+
+                for (key, rid) in &current_chunk {
+                    // Write as binary: 8 bytes for key, 8 bytes for rid
+                    writer
+                        .write_all(&key.to_le_bytes())
+                        .map_err(|e| IndexError::IoError(e.to_string()))?;
+                    writer
+                        .write_all(&(rid.page_id as u64).to_le_bytes())
+                        .map_err(|e| IndexError::IoError(e.to_string()))?;
+                    writer
+                        .write_all(&(rid.slot_id as u64).to_le_bytes())
+                        .map_err(|e| IndexError::IoError(e.to_string()))?;
+                }
+                writer
+                    .flush()
+                    .map_err(|e| IndexError::IoError(e.to_string()))?;
+
+                chunk_files.push(chunk_path);
+                current_chunk.clear();
+                eprintln!(
+                    "  Sorted chunk {} ({} total entries so far)",
+                    chunk_files.len(),
+                    total_entries
+                );
+            }
+        }
+
+        // Handle remaining entries
+        if !current_chunk.is_empty() {
+            current_chunk.sort_unstable_by_key(|e| e.0);
+
+            let chunk_path = temp_dir.join(format!("chunk_{}.dat", chunk_files.len()));
+            let file = File::create(&chunk_path).map_err(|e| IndexError::IoError(e.to_string()))?;
+            let mut writer = BufWriter::new(file);
+
+            for (key, rid) in &current_chunk {
+                writer
+                    .write_all(&key.to_le_bytes())
+                    .map_err(|e| IndexError::IoError(e.to_string()))?;
+                writer
+                    .write_all(&(rid.page_id as u64).to_le_bytes())
+                    .map_err(|e| IndexError::IoError(e.to_string()))?;
+                writer
+                    .write_all(&(rid.slot_id as u64).to_le_bytes())
+                    .map_err(|e| IndexError::IoError(e.to_string()))?;
+            }
+            writer
+                .flush()
+                .map_err(|e| IndexError::IoError(e.to_string()))?;
+
+            chunk_files.push(chunk_path);
+            current_chunk.clear();
+            eprintln!(
+                "  Sorted chunk {} ({} total entries)",
+                chunk_files.len(),
+                total_entries
+            );
+        }
+
+        if total_entries == 0 {
+            // No entries, create empty index
             let mut buffer_manager = self.buffer_manager.lock().unwrap();
             let index_file = IndexFile::create(
                 &mut buffer_manager,
@@ -124,18 +231,24 @@ impl IndexManager {
                 (table_name.to_string(), column_name.to_string()),
                 index_file,
             );
+
+            // Clean up temp directory
+            let _ = std::fs::remove_dir_all(&temp_dir);
             return Ok(());
         }
 
-        // Calculate optimal tree depth for informational purposes
-        let optimal_depth =
-            crate::btree::BPlusTree::calculate_optimal_depth(entry_count, DEFAULT_ORDER);
+        // Phase 2: K-way merge of sorted chunks
+        eprintln!("  Merging {} sorted chunks...", chunk_files.len());
 
-        // Sort entries by key (required for bulk load)
-        // This is the main memory cost, but unavoidable for bulk loading
-        entries.sort_unstable_by_key(|e| e.0);
+        let merged_iter = if chunk_files.len() == 1 {
+            // Only one chunk, read it directly
+            read_sorted_chunk(&chunk_files[0])?
+        } else {
+            // Multiple chunks, perform k-way merge
+            k_way_merge(chunk_files)?
+        };
 
-        // Create the index file
+        // Phase 3: Build B+ tree from sorted data
         let mut buffer_manager = self.buffer_manager.lock().unwrap();
         let mut index_file = IndexFile::create(
             &mut buffer_manager,
@@ -145,17 +258,11 @@ impl IndexManager {
             DEFAULT_ORDER,
         )?;
 
-        // Use bulk load from slice to avoid re-collecting the data
-        // We pass a slice to avoid the double allocation that would happen
-        // if bulk_load collected the iterator again
-        index_file.bulk_load_from_slice(&entries)?;
-
-        // Explicitly drop entries to free memory before flushing
-        drop(entries);
+        // Bulk load from the merged iterator
+        index_file.bulk_load_from_iter(merged_iter)?;
 
         // Flush to disk
         index_file.flush(&mut buffer_manager)?;
-
         drop(buffer_manager);
 
         // Store in open indexes
@@ -164,10 +271,12 @@ impl IndexManager {
             index_file,
         );
 
-        // Log success with tree statistics
+        // Clean up temporary files
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
         eprintln!(
-            "✓ Created index on {}.{} with {} entries (optimal depth: {})",
-            table_name, column_name, entry_count, optimal_depth
+            "✓ Created index on {}.{} with {} entries",
+            table_name, column_name, total_entries
         );
 
         Ok(())
@@ -387,5 +496,127 @@ impl Drop for IndexManager {
     fn drop(&mut self) {
         // Try to close all indexes cleanly
         let _ = self.close_all();
+    }
+}
+
+// Helper functions for external sorting
+
+/// Read a sorted chunk file and return an iterator
+fn read_sorted_chunk(path: &PathBuf) -> IndexResult<Box<dyn Iterator<Item = (i64, RecordId)>>> {
+    let file = File::open(path).map_err(|e| IndexError::IoError(e.to_string()))?;
+    let reader = BufReader::new(file);
+
+    Ok(Box::new(ChunkReader { reader }))
+}
+
+struct ChunkReader {
+    reader: BufReader<File>,
+}
+
+impl Iterator for ChunkReader {
+    type Item = (i64, RecordId);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut key_bytes = [0u8; 8];
+        let mut page_bytes = [0u8; 8];
+        let mut slot_bytes = [0u8; 8];
+
+        if self.reader.read_exact(&mut key_bytes).is_err() {
+            return None;
+        }
+        if self.reader.read_exact(&mut page_bytes).is_err() {
+            return None;
+        }
+        if self.reader.read_exact(&mut slot_bytes).is_err() {
+            return None;
+        }
+
+        let key = i64::from_le_bytes(key_bytes);
+        let page_id = u64::from_le_bytes(page_bytes) as usize;
+        let slot_id = u64::from_le_bytes(slot_bytes) as usize;
+
+        Some((key, RecordId::new(page_id, slot_id)))
+    }
+}
+
+/// K-way merge of sorted chunk files
+fn k_way_merge(
+    chunk_files: Vec<PathBuf>,
+) -> IndexResult<Box<dyn Iterator<Item = (i64, RecordId)>>> {
+    let mut readers = Vec::new();
+
+    for path in chunk_files {
+        readers.push(read_sorted_chunk(&path)?);
+    }
+
+    Ok(Box::new(KWayMergeIterator::new(readers)))
+}
+
+struct KWayMergeIterator {
+    heap: BinaryHeap<Reverse<MergeItem>>,
+    readers: Vec<Box<dyn Iterator<Item = (i64, RecordId)>>>,
+}
+
+#[derive(Eq, PartialEq)]
+struct MergeItem {
+    key: i64,
+    rid: RecordId,
+    reader_idx: usize,
+}
+
+impl Ord for MergeItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key
+            .cmp(&other.key)
+            .then_with(|| self.rid.page_id.cmp(&other.rid.page_id))
+            .then_with(|| self.rid.slot_id.cmp(&other.rid.slot_id))
+    }
+}
+
+impl PartialOrd for MergeItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl KWayMergeIterator {
+    fn new(mut readers: Vec<Box<dyn Iterator<Item = (i64, RecordId)>>>) -> Self {
+        let mut heap = BinaryHeap::new();
+
+        // Initialize heap with first element from each reader
+        for (idx, reader) in readers.iter_mut().enumerate() {
+            if let Some((key, rid)) = reader.next() {
+                heap.push(Reverse(MergeItem {
+                    key,
+                    rid,
+                    reader_idx: idx,
+                }));
+            }
+        }
+
+        Self { heap, readers }
+    }
+}
+
+impl Iterator for KWayMergeIterator {
+    type Item = (i64, RecordId);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(Reverse(item)) = self.heap.pop() {
+            let result = (item.key, item.rid);
+
+            // Try to get next item from the same reader
+            if let Some((key, rid)) = self.readers[item.reader_idx].next() {
+                self.heap.push(Reverse(MergeItem {
+                    key,
+                    rid,
+                    reader_idx: item.reader_idx,
+                }));
+            }
+
+            Some(result)
+        } else {
+            None
+        }
     }
 }

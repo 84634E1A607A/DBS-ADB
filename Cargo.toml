@@ -24,5 +24,5 @@ ahash = "0.8" # Fast non-cryptographic hash for HashMap - much faster than SipHa
 [dev-dependencies]
 tempfile = "3.8"
 
-[profile.release]
-debug = true
+# [profile.release]
+# debug = true

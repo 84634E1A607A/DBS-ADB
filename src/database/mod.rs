@@ -733,7 +733,6 @@ impl DatabaseManager {
         // Pre-allocate string buffer to avoid reallocations for string fields
         // Most CSV fields are small, so this avoids most allocations
         let mut string_buffer = String::with_capacity(256);
-        let mut rows_processed = 0;
 
         // Process records in batches - use schema to parse types directly
         for result in reader.records() {
@@ -776,19 +775,13 @@ impl DatabaseManager {
 
             if !values.is_empty() {
                 batch_rows.push(values);
-                rows_processed += 1;
-
-                // Print progress every PROGRESS_INTERVAL rows
-                if rows_processed % PROGRESS_INTERVAL == 0 {
-                    eprintln!("Loaded {} rows...", rows_processed);
-                }
 
                 // Insert batch when it reaches BATCH_SIZE
                 if batch_rows.len() >= BATCH_SIZE {
                     total_inserted +=
                         self.bulk_insert(table, std::mem::take(&mut batch_rows), true)?;
                     batch_rows.reserve(BATCH_SIZE); // Prepare for next batch
-                    
+
                     // Flush and clear buffer pool periodically to prevent memory buildup
                     // During bulk insert, we're appending to the end of the file, so old pages
                     // won't be accessed again. Flushing frees up memory and prevents thrashing.
