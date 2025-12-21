@@ -181,13 +181,13 @@ impl PagedFileManager {
 
         let offset = (page_id * PAGE_SIZE) as u64;
         let required_size = offset + PAGE_SIZE as u64;
-        
+
         // Extend file if necessary to ensure we can write at this offset
         let current_size = entry.file.metadata()?.len();
         if current_size < required_size {
             entry.file.set_len(required_size)?;
         }
-        
+
         entry.file.seek(SeekFrom::Start(offset))?;
         entry.file.write_all(buffer)?;
         // Note: Don't sync on every write - let the OS buffer and batch writes

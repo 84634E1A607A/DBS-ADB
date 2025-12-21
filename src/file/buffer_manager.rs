@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 
 use super::error::{FileError, FileResult};
 use super::file_manager::{FileHandle, PagedFileManager};
-use super::{PageId, BUFFER_POOL_SIZE, PAGE_SIZE};
+use super::{BUFFER_POOL_SIZE, PAGE_SIZE, PageId};
 
 /// A key identifying a page in the buffer pool
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,11 +60,7 @@ impl BufferManager {
     }
 
     /// Get a page from the buffer pool, loading it from disk if necessary
-    pub fn get_page(
-        &mut self,
-        file: FileHandle,
-        page_id: PageId,
-    ) -> FileResult<&[u8]> {
+    pub fn get_page(&mut self, file: FileHandle, page_id: PageId) -> FileResult<&[u8]> {
         let key = BufferKey { file, page_id };
 
         // Check if page is in buffer pool
@@ -81,11 +77,7 @@ impl BufferManager {
 
     /// Get a mutable reference to a page, loading it if necessary
     /// This automatically marks the page as dirty
-    pub fn get_page_mut(
-        &mut self,
-        file: FileHandle,
-        page_id: PageId,
-    ) -> FileResult<&mut [u8]> {
+    pub fn get_page_mut(&mut self, file: FileHandle, page_id: PageId) -> FileResult<&mut [u8]> {
         let key = BufferKey { file, page_id };
 
         // Check if page is in buffer pool
@@ -95,7 +87,7 @@ impl BufferManager {
 
         // Update LRU
         self.lru_cache.get_or_insert(key, || ());
-        
+
         // Mark as dirty and return mutable reference
         let entry = self.buffer_pool.get_mut(&key).unwrap();
         entry.dirty = true;
@@ -105,12 +97,12 @@ impl BufferManager {
     /// Mark a page as dirty (modified)
     pub fn mark_dirty(&mut self, file: FileHandle, page_id: PageId) -> FileResult<()> {
         let key = BufferKey { file, page_id };
-        
+
         let entry = self
             .buffer_pool
             .get_mut(&key)
             .ok_or(FileError::PageNotFound(page_id))?;
-        
+
         entry.dirty = true;
         Ok(())
     }
@@ -132,10 +124,14 @@ impl BufferManager {
     /// Flush all dirty pages to disk
     pub fn flush_all(&mut self) -> FileResult<()> {
         let keys: Vec<BufferKey> = self.buffer_pool.keys().copied().collect();
-        
+
         for key in keys {
             if self.buffer_pool[&key].dirty {
-                self.file_manager.write_page(key.file, key.page_id, &self.buffer_pool[&key].data)?;
+                self.file_manager.write_page(
+                    key.file,
+                    key.page_id,
+                    &self.buffer_pool[&key].data,
+                )?;
                 self.buffer_pool.get_mut(&key).unwrap().dirty = false;
             }
         }
@@ -177,13 +173,8 @@ impl BufferManager {
         self.file_manager.read_page(file, page_id, &mut data)?;
 
         // Add to buffer pool
-        self.buffer_pool.insert(
-            key,
-            BufferEntry {
-                data,
-                dirty: false,
-            },
-        );
+        self.buffer_pool
+            .insert(key, BufferEntry { data, dirty: false });
 
         // Add to LRU cache - this should never evict since we ensured space above
         self.lru_cache.put(key, ());
@@ -235,13 +226,13 @@ mod tests {
     fn setup_test_env() -> (TempDir, BufferManager, FileHandle) {
         let temp_dir = tempfile::tempdir().unwrap();
         let test_file = temp_dir.path().join("test.db");
-        
+
         let mut file_manager = PagedFileManager::new();
         file_manager.create_file(&test_file).unwrap();
         let handle = file_manager.open_file(&test_file).unwrap();
-        
+
         let buffer_manager = BufferManager::new(file_manager);
-        
+
         (temp_dir, buffer_manager, handle)
     }
 
@@ -252,7 +243,9 @@ mod tests {
         // Write a page directly through file manager
         let mut write_buffer = vec![0u8; PAGE_SIZE];
         write_buffer[0] = 42;
-        bm.file_manager_mut().write_page(handle, 0, &write_buffer).unwrap();
+        bm.file_manager_mut()
+            .write_page(handle, 0, &write_buffer)
+            .unwrap();
 
         // Read through buffer manager
         let page = bm.get_page(handle, 0).unwrap();
@@ -361,11 +354,11 @@ mod tests {
     fn test_lru_eviction() {
         let temp_dir = tempfile::tempdir().unwrap();
         let test_file = temp_dir.path().join("test.db");
-        
+
         let mut file_manager = PagedFileManager::new();
         file_manager.create_file(&test_file).unwrap();
         let handle = file_manager.open_file(&test_file).unwrap();
-        
+
         // Create buffer manager with small capacity
         let mut bm = BufferManager::with_capacity(file_manager, 3);
 
@@ -388,11 +381,11 @@ mod tests {
     fn test_lru_update_on_access() {
         let temp_dir = tempfile::tempdir().unwrap();
         let test_file = temp_dir.path().join("test.db");
-        
+
         let mut file_manager = PagedFileManager::new();
         file_manager.create_file(&test_file).unwrap();
         let handle = file_manager.open_file(&test_file).unwrap();
-        
+
         let mut bm = BufferManager::with_capacity(file_manager, 3);
 
         // Load 3 pages
@@ -415,11 +408,11 @@ mod tests {
     fn test_dirty_page_flushed_on_eviction() {
         let temp_dir = tempfile::tempdir().unwrap();
         let test_file = temp_dir.path().join("test.db");
-        
+
         let mut file_manager = PagedFileManager::new();
         file_manager.create_file(&test_file).unwrap();
         let handle = file_manager.open_file(&test_file).unwrap();
-        
+
         let mut bm = BufferManager::with_capacity(file_manager, 2);
 
         // Modify a page
@@ -443,13 +436,13 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let file1 = temp_dir.path().join("test1.db");
         let file2 = temp_dir.path().join("test2.db");
-        
+
         let mut file_manager = PagedFileManager::new();
         file_manager.create_file(&file1).unwrap();
         file_manager.create_file(&file2).unwrap();
         let handle1 = file_manager.open_file(&file1).unwrap();
         let handle2 = file_manager.open_file(&file2).unwrap();
-        
+
         let mut bm = BufferManager::new(file_manager);
 
         // Write to different files
@@ -471,11 +464,11 @@ mod tests {
     fn test_drop_flushes_dirty_pages() {
         let temp_dir = tempfile::tempdir().unwrap();
         let test_file = temp_dir.path().join("test.db");
-        
+
         let mut file_manager = PagedFileManager::new();
         file_manager.create_file(&test_file).unwrap();
         let handle = file_manager.open_file(&test_file).unwrap();
-        
+
         {
             let mut bm = BufferManager::new(file_manager);
             let page = bm.get_page_mut(handle, 0).unwrap();

@@ -28,11 +28,7 @@ pub struct PersistentBPlusTree {
 
 impl PersistentBPlusTree {
     /// Create a new index file
-    pub fn create(
-        buffer_mgr: &mut BufferManager,
-        path: &str,
-        order: usize,
-    ) -> IndexResult<Self> {
+    pub fn create(buffer_mgr: &mut BufferManager, path: &str, order: usize) -> IndexResult<Self> {
         // Create the file
         buffer_mgr.file_manager_mut().create_file(path)?;
         let file_handle = buffer_mgr.file_manager_mut().open_file(path)?;
@@ -63,10 +59,7 @@ impl PersistentBPlusTree {
     }
 
     /// Open an existing index file
-    pub fn open(
-        buffer_mgr: &mut BufferManager,
-        path: &str,
-    ) -> IndexResult<Self> {
+    pub fn open(buffer_mgr: &mut BufferManager, path: &str) -> IndexResult<Self> {
         // Open the file
         let file_handle = buffer_mgr.file_manager_mut().open_file(path)?;
 

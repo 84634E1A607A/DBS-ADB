@@ -47,7 +47,7 @@ impl RecordManager {
         if self.open_tables.contains_key(schema.table_name()) {
             return Ok(());
         }
-        
+
         let mut buffer_manager = self.buffer_manager.lock().unwrap();
         let table_file = TableFile::open(&mut *buffer_manager, path, schema)?;
         drop(buffer_manager);
