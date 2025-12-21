@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use crate::btree::{BPlusNode, BPlusTree, NodeId};
-use crate::file::{BufferManager, FileHandle, PagedFileManager};
+use crate::file::{BufferManager, FileHandle};
 use crate::record::RecordId;
 
 use super::error::{IndexError, IndexResult};

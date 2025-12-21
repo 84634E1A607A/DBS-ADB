@@ -1,6 +1,6 @@
 //! Index file management
 
-use crate::file::{BufferManager, PagedFileManager};
+use crate::file::BufferManager;
 use crate::record::RecordId;
 
 use super::error::{IndexError, IndexResult};

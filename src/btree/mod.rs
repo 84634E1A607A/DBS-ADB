@@ -23,6 +23,7 @@ pub type BPlusKey = i64;
 /// Default B+ tree order optimized for 8KB pages
 /// - Leaf node: 499 entries (order - 1) = 499 * 16 bytes + 16 byte header = 8000 bytes
 /// - Internal node: 500 children = 500 * 12 bytes + 16 byte header = 6016 bytes
+///
 /// This ensures one node fits comfortably in one 8KB page
 pub const DEFAULT_ORDER: usize = 500;
 
@@ -248,10 +249,10 @@ impl BPlusTree {
             };
 
             // Check if we've passed the key
-            if let Some(min_key) = leaf.min_key() {
-                if min_key > key {
-                    break;
-                }
+            if let Some(min_key) = leaf.min_key()
+                && min_key > key
+            {
+                break;
             }
 
             // Collect matching entries
@@ -585,7 +586,7 @@ impl BPlusTree {
         self.entry_count = 0;
 
         let max_leaf_entries = self.max_leaf_entries();
-        let min_leaf_entries = self.min_leaf_entries();
+        let _min_leaf_entries = self.min_leaf_entries();
         let max_internal_children = self.max_internal_children();
 
         if all_entries.is_empty() {
@@ -608,7 +609,7 @@ impl BPlusTree {
 
         // Calculate number of leaves needed
         // We want to fill leaves as much as possible while respecting minimum constraints
-        let ideal_leaf_count = (total_entries + max_leaf_entries - 1) / max_leaf_entries;
+        let ideal_leaf_count = total_entries.div_ceil(max_leaf_entries);
         let actual_leaf_count = ideal_leaf_count.max(1);
 
         // Distribute entries evenly across leaves
@@ -625,7 +626,7 @@ impl BPlusTree {
                 remaining_entries
             } else {
                 // Distribute evenly among remaining leaves
-                let avg = (remaining_entries + remaining_leaves - 1) / remaining_leaves;
+                let avg = remaining_entries.div_ceil(remaining_leaves);
                 avg.min(max_leaf_entries)
             };
 
@@ -687,7 +688,7 @@ impl BPlusTree {
                         // Ensure both nodes meet minimum constraint
                         let total_for_last_two = remaining;
                         // Try to distribute evenly while respecting min/max constraints
-                        let first_half = (total_for_last_two + 1) / 2; // Round up
+                        let first_half = total_for_last_two.div_ceil(2); // Round up
                         first_half
                             .min(max_internal_children)
                             .max(min_internal_children)
@@ -1061,10 +1062,9 @@ impl BPlusTree {
             if let Some(parent) = self
                 .get_node_mut(parent_id)
                 .and_then(|n| n.as_internal_mut())
+                && remaining_idx < parent.keys.len()
             {
-                if remaining_idx < parent.keys.len() {
-                    parent.keys[remaining_idx] = child_max;
-                }
+                parent.keys[remaining_idx] = child_max;
             }
         }
 

@@ -34,7 +34,7 @@ impl RecordManager {
     /// Create a new table file
     pub fn create_table(&mut self, path: &str, schema: TableSchema) -> RecordResult<()> {
         let mut buffer_manager = self.buffer_manager.lock().unwrap();
-        let table_file = TableFile::create(&mut *buffer_manager, path, schema)?;
+        let table_file = TableFile::create(&mut buffer_manager, path, schema)?;
         drop(buffer_manager);
         self.open_tables
             .insert(table_file.table_name().to_string(), table_file);
@@ -49,7 +49,7 @@ impl RecordManager {
         }
 
         let mut buffer_manager = self.buffer_manager.lock().unwrap();
-        let table_file = TableFile::open(&mut *buffer_manager, path, schema)?;
+        let table_file = TableFile::open(&mut buffer_manager, path, schema)?;
         drop(buffer_manager);
         self.open_tables
             .insert(table_file.table_name().to_string(), table_file);
@@ -69,7 +69,7 @@ impl RecordManager {
             .open_tables
             .get_mut(table_name)
             .ok_or_else(|| RecordError::TableNotOpen(table_name.to_string()))?;
-        table.insert_record(&mut *buffer_manager, &record)
+        table.insert_record(&mut buffer_manager, &record)
     }
 
     /// Bulk insert multiple records into a table
@@ -89,7 +89,7 @@ impl RecordManager {
 
         let mut record_ids = Vec::with_capacity(records.len());
         for record in &records {
-            let rid = table.insert_record(&mut *buffer_manager, record)?;
+            let rid = table.insert_record(&mut buffer_manager, record)?;
             record_ids.push(rid);
         }
 
@@ -103,7 +103,7 @@ impl RecordManager {
             .open_tables
             .get_mut(table_name)
             .ok_or_else(|| RecordError::TableNotOpen(table_name.to_string()))?;
-        table.delete_record(&mut *buffer_manager, rid)
+        table.delete_record(&mut buffer_manager, rid)
     }
 
     /// Update a record in a table
@@ -113,7 +113,7 @@ impl RecordManager {
             .open_tables
             .get_mut(table_name)
             .ok_or_else(|| RecordError::TableNotOpen(table_name.to_string()))?;
-        table.update_record(&mut *buffer_manager, rid, &record)
+        table.update_record(&mut buffer_manager, rid, &record)
     }
 
     /// Get a record from a table
@@ -123,7 +123,7 @@ impl RecordManager {
             .open_tables
             .get_mut(table_name)
             .ok_or_else(|| RecordError::TableNotOpen(table_name.to_string()))?;
-        table.get_record(&mut *buffer_manager, rid)
+        table.get_record(&mut buffer_manager, rid)
     }
 
     /// Scan all records in a table
@@ -133,6 +133,6 @@ impl RecordManager {
             .open_tables
             .get_mut(table_name)
             .ok_or_else(|| RecordError::TableNotOpen(table_name.to_string()))?;
-        table.scan(&mut *buffer_manager)
+        table.scan(&mut buffer_manager)
     }
 }

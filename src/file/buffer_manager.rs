@@ -1,6 +1,5 @@
 use ahash::AHashMap;
 use lru::LruCache;
-use std::mem;
 use std::num::NonZeroUsize;
 
 use super::error::{FileError, FileResult};

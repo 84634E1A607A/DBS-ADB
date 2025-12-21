@@ -130,11 +130,10 @@ impl DatabaseManager {
         let mut databases = Vec::new();
         for entry in fs::read_dir(&self.data_dir)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
+            if entry.file_type()?.is_dir()
+                && let Some(name) = entry.file_name().to_str() {
                     databases.push(name.to_string());
                 }
-            }
         }
         databases.sort();
         Ok(databases)
@@ -350,8 +349,8 @@ impl DatabaseManager {
             let record = Record::new(record_values);
 
             // Check for duplicates within the batch itself
-            if !skip_pk_check {
-                if let Some(ref indices) = pk_indices {
+            if !skip_pk_check
+                && let Some(ref indices) = pk_indices {
                     let pk_key: Vec<String> = indices
                         .iter()
                         .map(|&idx| format!("{:?}", record.get(idx).unwrap()))
@@ -362,14 +361,13 @@ impl DatabaseManager {
                         return Err(DatabaseError::PrimaryKeyViolation);
                     }
                 }
-            }
 
             records.push(record);
         }
 
         // Check against existing records using index if available (only for single-column integer PKs)
-        if !skip_pk_check {
-            if let Some(ref pk_cols) = table_meta.primary_key {
+        if !skip_pk_check
+            && let Some(ref pk_cols) = table_meta.primary_key {
                 if pk_cols.len() == 1 {
                     let pk_col_name = &pk_cols[0];
                     let pk_col_idx = table_meta
@@ -380,7 +378,7 @@ impl DatabaseManager {
 
                     // Try to use index for primary key checking
                     let db_path = self.data_dir.join(db_name.as_str());
-                    let index_key = (table.to_string(), pk_col_name.clone());
+                    let _index_key = (table.to_string(), pk_col_name.clone());
 
                     // Try to open the index if it exists
                     let has_index = self
@@ -391,15 +389,14 @@ impl DatabaseManager {
                     if has_index {
                         // Use index for fast lookup
                         for record in &records {
-                            if let RecordValue::Int(pk_val) = record.get(pk_col_idx).unwrap() {
-                                if self
+                            if let RecordValue::Int(pk_val) = record.get(pk_col_idx).unwrap()
+                                && self
                                     .index_manager
                                     .search(table, pk_col_name, *pk_val as i64)
                                     .is_some()
                                 {
                                     return Err(DatabaseError::PrimaryKeyViolation);
                                 }
-                            }
                         }
                     } else {
                         // Fallback: scan existing records (only once for the whole batch)
@@ -438,7 +435,6 @@ impl DatabaseManager {
                     }
                 }
             }
-        }
 
         // Insert all records in one batch - much faster as it holds the lock only once
         let _record_ids = self.record_manager.bulk_insert(table, records)?;
@@ -492,7 +488,7 @@ impl DatabaseManager {
         updates: Vec<(String, ParserValue)>,
         where_clauses: Option<Vec<WhereClause>>,
     ) -> DatabaseResult<usize> {
-        let (table_meta, schema) = {
+        let (_table_meta, schema) = {
             let metadata = self
                 .current_metadata
                 .as_ref()
@@ -618,7 +614,7 @@ impl DatabaseManager {
 
         // Ensure table is open
         let table_path_str = table_path.to_string_lossy().to_string();
-        if self.record_manager.scan(&table_name).is_err() {
+        if self.record_manager.scan(table_name).is_err() {
             // Table not open, open it
             self.record_manager
                 .open_table(&table_path_str, schema.clone())?;
@@ -724,7 +720,7 @@ impl DatabaseManager {
             .has_headers(false)
             .flexible(true) // Allow varying number of fields per row
             .from_path(file_path)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         let num_columns = table_meta.columns.len();
         const BATCH_SIZE: usize = 10000; // Process 10K rows at a time to reduce memory pressure
