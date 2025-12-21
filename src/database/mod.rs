@@ -131,9 +131,10 @@ impl DatabaseManager {
         for entry in fs::read_dir(&self.data_dir)? {
             let entry = entry?;
             if entry.file_type()?.is_dir()
-                && let Some(name) = entry.file_name().to_str() {
-                    databases.push(name.to_string());
-                }
+                && let Some(name) = entry.file_name().to_str()
+            {
+                databases.push(name.to_string());
+            }
         }
         databases.sort();
         Ok(databases)
@@ -329,9 +330,11 @@ impl DatabaseManager {
 
         // Convert all rows and check for duplicates within batch
         let mut records = Vec::with_capacity(rows.len());
+
         for row in rows {
             // Convert parser values to record values
-            let mut record_values = Vec::new();
+            let mut record_values = Vec::with_capacity(table_meta.columns.len());
+
             for (i, value) in row.iter().enumerate() {
                 if i >= table_meta.columns.len() {
                     break;
@@ -349,75 +352,55 @@ impl DatabaseManager {
             let record = Record::new(record_values);
 
             // Check for duplicates within the batch itself
-            if !skip_pk_check
-                && let Some(ref indices) = pk_indices {
-                    let pk_key: Vec<String> = indices
-                        .iter()
-                        .map(|&idx| format!("{:?}", record.get(idx).unwrap()))
-                        .collect();
-                    let pk_string = pk_key.join("|");
+            if !skip_pk_check && let Some(ref indices) = pk_indices {
+                let pk_key: Vec<String> = indices
+                    .iter()
+                    .map(|&idx| format!("{:?}", record.get(idx).unwrap()))
+                    .collect();
+                let pk_string = pk_key.join("|");
 
-                    if !batch_pk_set.insert(pk_string) {
-                        return Err(DatabaseError::PrimaryKeyViolation);
-                    }
+                if !batch_pk_set.insert(pk_string) {
+                    return Err(DatabaseError::PrimaryKeyViolation);
                 }
+            }
 
             records.push(record);
         }
 
         // Check against existing records using index if available (only for single-column integer PKs)
-        if !skip_pk_check
-            && let Some(ref pk_cols) = table_meta.primary_key {
-                if pk_cols.len() == 1 {
-                    let pk_col_name = &pk_cols[0];
-                    let pk_col_idx = table_meta
-                        .columns
-                        .iter()
-                        .position(|c| &c.name == pk_col_name)
-                        .unwrap();
+        if !skip_pk_check && let Some(ref pk_cols) = table_meta.primary_key {
+            if pk_cols.len() == 1 {
+                let pk_col_name = &pk_cols[0];
+                let pk_col_idx = table_meta
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == pk_col_name)
+                    .unwrap();
 
-                    // Try to use index for primary key checking
-                    let db_path = self.data_dir.join(db_name.as_str());
-                    let _index_key = (table.to_string(), pk_col_name.clone());
+                // Try to use index for primary key checking
+                let db_path = self.data_dir.join(db_name.as_str());
+                let _index_key = (table.to_string(), pk_col_name.clone());
 
-                    // Try to open the index if it exists
-                    let has_index = self
-                        .index_manager
-                        .open_index(&db_path.to_string_lossy(), table, pk_col_name)
-                        .is_ok();
+                // Try to open the index if it exists
+                let has_index = self
+                    .index_manager
+                    .open_index(&db_path.to_string_lossy(), table, pk_col_name)
+                    .is_ok();
 
-                    if has_index {
-                        // Use index for fast lookup
-                        for record in &records {
-                            if let RecordValue::Int(pk_val) = record.get(pk_col_idx).unwrap()
-                                && self
-                                    .index_manager
-                                    .search(table, pk_col_name, *pk_val as i64)
-                                    .is_some()
-                                {
-                                    return Err(DatabaseError::PrimaryKeyViolation);
-                                }
-                        }
-                    } else {
-                        // Fallback: scan existing records (only once for the whole batch)
-                        let existing_records = self.record_manager.scan(table)?;
-                        for record in &records {
-                            for (_, existing_record) in &existing_records {
-                                let mut is_duplicate = true;
-                                for &pk_idx in pk_indices.as_ref().unwrap() {
-                                    if record.get(pk_idx) != existing_record.get(pk_idx) {
-                                        is_duplicate = false;
-                                        break;
-                                    }
-                                }
-                                if is_duplicate {
-                                    return Err(DatabaseError::PrimaryKeyViolation);
-                                }
-                            }
+                if has_index {
+                    // Use index for fast lookup
+                    for record in &records {
+                        if let RecordValue::Int(pk_val) = record.get(pk_col_idx).unwrap()
+                            && self
+                                .index_manager
+                                .search(table, pk_col_name, *pk_val as i64)
+                                .is_some()
+                        {
+                            return Err(DatabaseError::PrimaryKeyViolation);
                         }
                     }
                 } else {
-                    // Multi-column PK: use table scan (but only once for the whole batch)
+                    // Fallback: scan existing records (only once for the whole batch)
                     let existing_records = self.record_manager.scan(table)?;
                     for record in &records {
                         for (_, existing_record) in &existing_records {
@@ -434,7 +417,25 @@ impl DatabaseManager {
                         }
                     }
                 }
+            } else {
+                // Multi-column PK: use table scan (but only once for the whole batch)
+                let existing_records = self.record_manager.scan(table)?;
+                for record in &records {
+                    for (_, existing_record) in &existing_records {
+                        let mut is_duplicate = true;
+                        for &pk_idx in pk_indices.as_ref().unwrap() {
+                            if record.get(pk_idx) != existing_record.get(pk_idx) {
+                                is_duplicate = false;
+                                break;
+                            }
+                        }
+                        if is_duplicate {
+                            return Err(DatabaseError::PrimaryKeyViolation);
+                        }
+                    }
+                }
             }
+        }
 
         // Insert all records in one batch - much faster as it holds the lock only once
         let _record_ids = self.record_manager.bulk_insert(table, records)?;
@@ -723,16 +724,23 @@ impl DatabaseManager {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         let num_columns = table_meta.columns.len();
-        const BATCH_SIZE: usize = 10000; // Process 10K rows at a time to reduce memory pressure
+        const BATCH_SIZE: usize = 50000; // Larger batches reduce overhead from allocating/deallocating vectors
+        const PROGRESS_INTERVAL: usize = 50_000; // Report progress every 100k lines
 
         let mut total_inserted = 0;
         let mut batch_rows = Vec::with_capacity(BATCH_SIZE);
+
+        // Pre-allocate string buffer to avoid reallocations for string fields
+        // Most CSV fields are small, so this avoids most allocations
+        let mut string_buffer = String::with_capacity(256);
+        let mut rows_processed = 0;
 
         // Process records in batches - use schema to parse types directly
         for result in reader.records() {
             let record = result.map_err(|e| std::io::Error::other(e.to_string()))?;
 
             let mut values = Vec::with_capacity(num_columns);
+
             for (idx, field) in record.iter().enumerate() {
                 if idx >= table_meta.columns.len() {
                     break; // Skip extra fields
@@ -754,7 +762,12 @@ impl DatabaseManager {
                             Ok(f) => ParserValue::Float(f),
                             Err(_) => ParserValue::Null,
                         },
-                        crate::record::DataType::Char(_) => ParserValue::String(field.to_string()),
+                        crate::record::DataType::Char(_) => {
+                            // Reuse string buffer to avoid allocation for each string
+                            string_buffer.clear();
+                            string_buffer.push_str(field);
+                            ParserValue::String(string_buffer.clone())
+                        }
                     }
                 };
 
@@ -763,12 +776,23 @@ impl DatabaseManager {
 
             if !values.is_empty() {
                 batch_rows.push(values);
+                rows_processed += 1;
+
+                // Print progress every PROGRESS_INTERVAL rows
+                if rows_processed % PROGRESS_INTERVAL == 0 {
+                    eprintln!("Loaded {} rows...", rows_processed);
+                }
 
                 // Insert batch when it reaches BATCH_SIZE
                 if batch_rows.len() >= BATCH_SIZE {
                     total_inserted +=
                         self.bulk_insert(table, std::mem::take(&mut batch_rows), true)?;
                     batch_rows.reserve(BATCH_SIZE); // Prepare for next batch
+                    
+                    // Flush and clear buffer pool periodically to prevent memory buildup
+                    // During bulk insert, we're appending to the end of the file, so old pages
+                    // won't be accessed again. Flushing frees up memory and prevents thrashing.
+                    self.buffer_manager.lock().unwrap().flush_and_clear()?;
                 }
             }
         }
@@ -776,11 +800,13 @@ impl DatabaseManager {
         // Insert remaining rows
         if !batch_rows.is_empty() {
             total_inserted += self.bulk_insert(table, batch_rows, true)?;
+            // Final flush after last batch
+            self.buffer_manager.lock().unwrap().flush_and_clear()?;
         }
 
         eprintln!(
-            "Loaded data from file {} into table {} without indexes",
-            file_path, table
+            "Loaded {} rows from file {} into table {} without indexes",
+            total_inserted, file_path, table
         );
 
         // Step 5: Reconstruct all indexes using bulk create

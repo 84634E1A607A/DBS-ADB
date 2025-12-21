@@ -89,7 +89,9 @@ impl RecordManager {
 
         let mut record_ids = Vec::with_capacity(records.len());
         for record in &records {
-            let rid = table.insert_record(&mut buffer_manager, record)?;
+            // Use bulk insert hint to skip searching old pages for free space
+            // This prevents loading already-flushed pages back into buffer
+            let rid = table.insert_record_with_hint(&mut buffer_manager, record, true)?;
             record_ids.push(rid);
         }
 

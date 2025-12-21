@@ -71,6 +71,18 @@ impl TableFile {
         buffer_mgr: &mut BufferManager,
         record: &Record,
     ) -> RecordResult<RecordId> {
+        self.insert_record_with_hint(buffer_mgr, record, false)
+    }
+
+    /// Insert a record with a hint about whether to skip searching old pages
+    /// When bulk_insert_hint is true, always allocates a new page instead of
+    /// searching from the beginning - critical optimization for bulk loading
+    pub fn insert_record_with_hint(
+        &mut self,
+        buffer_mgr: &mut BufferManager,
+        record: &Record,
+        bulk_insert_hint: bool,
+    ) -> RecordResult<RecordId> {
         // Validate record
         self.schema.validate_record(record.values())?;
 
@@ -103,8 +115,9 @@ impl TableFile {
             let next_page = page.next_page();
             if next_page == 0 {
                 // No next page
-                if !checked_from_start && page_id != self.first_page_id {
+                if !bulk_insert_hint && !checked_from_start && page_id != self.first_page_id {
                     // We started from last_insert_page_id, try from beginning
+                    // BUT: skip this in bulk insert mode to avoid loading old pages
                     page_id = self.first_page_id;
                     checked_from_start = true;
                 } else {

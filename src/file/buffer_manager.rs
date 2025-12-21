@@ -1,4 +1,3 @@
-use ahash::AHashMap;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 
@@ -25,10 +24,9 @@ struct BufferEntry {
 pub struct BufferManager {
     /// Underlying file manager
     file_manager: PagedFileManager,
-    /// Buffer pool: stores actual page data (using AHashMap for fast lookups)
-    buffer_pool: AHashMap<BufferKey, BufferEntry>,
-    /// LRU cache for tracking page access order
-    lru_cache: LruCache<BufferKey, ()>,
+    /// Combined buffer pool and LRU tracker: single data structure for both storage and eviction policy
+    /// This eliminates redundant hash lookups - every operation now hits only ONE hash table
+    buffer_pool: LruCache<BufferKey, BufferEntry>,
     /// Maximum size of the buffer pool
     max_pool_size: usize,
     /// Reusable buffer for loading pages (avoids allocation on every load)
@@ -45,8 +43,7 @@ impl BufferManager {
     pub fn with_capacity(file_manager: PagedFileManager, capacity: usize) -> Self {
         Self {
             file_manager,
-            buffer_pool: AHashMap::new(),
-            lru_cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
+            buffer_pool: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
             max_pool_size: capacity,
             load_buffer: vec![0u8; PAGE_SIZE], // Allocate once, reuse for all page loads
         }
@@ -66,16 +63,14 @@ impl BufferManager {
     pub fn get_page(&mut self, file: FileHandle, page_id: PageId) -> FileResult<&[u8]> {
         let key = BufferKey { file, page_id };
 
-        // Check if page is in buffer pool
-        if self.buffer_pool.contains_key(&key) {
-            // Update LRU (mark as recently used)
-            self.lru_cache.get_or_insert(key, || ());
-            return Ok(&self.buffer_pool[&key].data);
+        // Try to get the page - single hash lookup with peek to avoid borrow issues
+        if self.buffer_pool.peek(&key).is_none() {
+            // Page not in buffer, need to load it
+            self.load_page(file, page_id)?;
         }
 
-        // Page not in buffer, need to load it
-        self.load_page(file, page_id)?;
-        Ok(&self.buffer_pool[&key].data)
+        // Now get the page (this updates LRU automatically)
+        Ok(&self.buffer_pool.get(&key).unwrap().data)
     }
 
     /// Get a mutable reference to a page, loading it if necessary
@@ -83,15 +78,13 @@ impl BufferManager {
     pub fn get_page_mut(&mut self, file: FileHandle, page_id: PageId) -> FileResult<&mut [u8]> {
         let key = BufferKey { file, page_id };
 
-        // Check if page is in buffer pool
-        if !self.buffer_pool.contains_key(&key) {
+        // Try to get the page first - single hash lookup
+        if self.buffer_pool.get_mut(&key).is_none() {
+            // Page not in buffer, load it
             self.load_page(file, page_id)?;
         }
 
-        // Update LRU
-        self.lru_cache.get_or_insert(key, || ());
-
-        // Mark as dirty and return mutable reference
+        // Get mutable reference again (this updates LRU automatically)
         let entry = self.buffer_pool.get_mut(&key).unwrap();
         entry.dirty = true;
         Ok(&mut entry.data)
@@ -114,27 +107,37 @@ impl BufferManager {
     pub fn flush_page(&mut self, file: FileHandle, page_id: PageId) -> FileResult<()> {
         let key = BufferKey { file, page_id };
 
-        if let Some(entry) = self.buffer_pool.get_mut(&key)
+        // Single peek operation - doesn't update LRU since we're just flushing
+        if let Some(entry) = self.buffer_pool.peek_mut(&key)
             && entry.dirty
         {
             self.file_manager.write_page(file, page_id, &entry.data)?;
             entry.dirty = false;
         }
+
         Ok(())
     }
 
     /// Flush all dirty pages to disk
     pub fn flush_all(&mut self) -> FileResult<()> {
-        let keys: Vec<BufferKey> = self.buffer_pool.keys().copied().collect();
+        // Iterate and flush all dirty pages without collecting keys first
+        // Use iter() to avoid updating LRU order during flush
+        let mut dirty_pages = Vec::new();
 
-        for key in keys {
-            if self.buffer_pool[&key].dirty {
-                self.file_manager.write_page(
-                    key.file,
-                    key.page_id,
-                    &self.buffer_pool[&key].data,
-                )?;
-                self.buffer_pool.get_mut(&key).unwrap().dirty = false;
+        for (key, entry) in self.buffer_pool.iter() {
+            if entry.dirty {
+                dirty_pages.push(*key);
+            }
+        }
+
+        for key in dirty_pages {
+            // Use peek_mut to avoid LRU update during flush
+            if let Some(entry) = self.buffer_pool.peek_mut(&key)
+                && entry.dirty
+            {
+                self.file_manager
+                    .write_page(key.file, key.page_id, &entry.data)?;
+                entry.dirty = false;
             }
         }
 
@@ -150,9 +153,8 @@ impl BufferManager {
         // Flush all dirty pages first
         self.flush_all()?;
 
-        // Clear both the buffer pool and LRU cache
+        // Clear the combined buffer pool and LRU cache
         self.buffer_pool.clear();
-        self.lru_cache.clear();
 
         Ok(())
     }
@@ -162,13 +164,12 @@ impl BufferManager {
         let key = BufferKey { file, page_id };
 
         // Only evict if the page is actually in the buffer
-        if self.buffer_pool.contains_key(&key) {
+        if self.buffer_pool.peek(&key).is_some() {
             // Flush if dirty
             self.flush_page(file, page_id)?;
 
-            // Remove from buffer pool and LRU
-            self.buffer_pool.remove(&key);
-            self.lru_cache.pop(&key);
+            // Remove from buffer pool (LRU is automatically updated)
+            self.buffer_pool.pop(&key);
         }
 
         Ok(())
@@ -192,31 +193,30 @@ impl BufferManager {
         self.file_manager
             .read_page(file, page_id, &mut self.load_buffer)?;
 
-        // Move the loaded data into buffer pool using mem::replace
+        // Move the loaded data into buffer pool using mem::take
         // This swaps ownership without copying - the buffer moves into the pool
         // and we get back an empty Vec (which will be replaced on next eviction or reused)
         let data = std::mem::take(&mut self.load_buffer);
-        self.buffer_pool
-            .insert(key, BufferEntry { data, dirty: false });
 
-        // Add to LRU cache - this should never evict since we ensured space above
-        self.lru_cache.put(key, ());
+        // Single operation: insert into LRU cache (which handles eviction automatically)
+        self.buffer_pool
+            .put(key, BufferEntry { data, dirty: false });
 
         Ok(())
     }
 
     /// Evict the least recently used page from the buffer pool
     fn evict_lru_page(&mut self) -> FileResult<()> {
-        // Find and remove the LRU page from the LRU cache
-        if let Some((key, _)) = self.lru_cache.pop_lru() {
-            // Flush if dirty
-            self.flush_page(key.file, key.page_id)?;
+        // Pop LRU entry from the cache (single operation)
+        if let Some((key, entry)) = self.buffer_pool.pop_lru() {
+            // Flush if dirty before evicting
+            if entry.dirty {
+                self.file_manager
+                    .write_page(key.file, key.page_id, &entry.data)?;
+            }
 
             // Recycle the evicted buffer for future page loads (avoid allocation)
-            if let Some(entry) = self.buffer_pool.remove(&key) {
-                // Reuse this buffer - it's already PAGE_SIZE, no need to reallocate
-                self.load_buffer = entry.data;
-            }
+            self.load_buffer = entry.data;
         }
 
         Ok(())
@@ -230,12 +230,12 @@ impl BufferManager {
     /// Check if a page is in the buffer pool
     pub fn is_page_cached(&self, file: FileHandle, page_id: PageId) -> bool {
         let key = BufferKey { file, page_id };
-        self.buffer_pool.contains_key(&key)
+        self.buffer_pool.contains(&key)
     }
 
     /// Get the number of dirty pages in the buffer pool
     pub fn dirty_page_count(&self) -> usize {
-        self.buffer_pool.values().filter(|e| e.dirty).count()
+        self.buffer_pool.iter().filter(|(_, e)| e.dirty).count()
     }
 }
 
