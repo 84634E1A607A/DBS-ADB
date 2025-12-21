@@ -575,46 +575,69 @@ impl BPlusTree {
         self.entry_count = 0;
 
         let max_leaf_entries = self.max_leaf_entries();
+        let min_leaf_entries = self.min_leaf_entries();
         let max_internal_children = self.max_internal_children();
 
-        // Collect entries into leaf nodes
-        let mut leaves: Vec<NodeId> = Vec::new();
-        let mut current_leaf = LeafNode::new();
-        let mut prev_key = None;
+        // Collect all entries first to know total count
+        let all_entries: Vec<(BPlusKey, RecordId)> = entries.collect();
 
-        for (key, value) in entries {
-            // Verify sorted order
-            if let Some(prev) = prev_key {
-                if key < prev {
-                    return Err(BPlusTreeError::InvalidState(
-                        "Bulk load requires sorted entries".to_string(),
-                    ));
-                }
+        if all_entries.is_empty() {
+            return Ok(());
+        }
+
+        // Verify sorted order
+        for i in 1..all_entries.len() {
+            if all_entries[i].0 < all_entries[i - 1].0 {
+                return Err(BPlusTreeError::InvalidState(
+                    "Bulk load requires sorted entries".to_string(),
+                ));
             }
-            prev_key = Some(key);
+        }
 
-            // Add to current leaf
-            current_leaf.keys.push(key);
-            current_leaf.values.push(value);
-            self.entry_count += 1;
+        // Distribute entries into leaf nodes
+        let mut leaves: Vec<NodeId> = Vec::new();
+        let total_entries = all_entries.len();
+        let mut entry_idx = 0;
 
-            // If leaf is full, allocate it and start a new one
-            if current_leaf.len() >= max_leaf_entries {
+        // Calculate number of leaves needed
+        // We want to fill leaves as much as possible while respecting minimum constraints
+        let ideal_leaf_count = (total_entries + max_leaf_entries - 1) / max_leaf_entries;
+        let actual_leaf_count = ideal_leaf_count.max(1);
+
+        // Distribute entries evenly across leaves
+        for leaf_num in 0..actual_leaf_count {
+            let mut current_leaf = LeafNode::new();
+
+            // Calculate how many entries this leaf should get
+            let remaining_entries = total_entries - entry_idx;
+            let remaining_leaves = actual_leaf_count - leaf_num;
+
+            // Try to distribute evenly, but respect max constraint
+            let entries_for_this_leaf = if remaining_leaves == 1 {
+                // Last leaf - take all remaining
+                remaining_entries
+            } else {
+                // Distribute evenly among remaining leaves
+                let avg = (remaining_entries + remaining_leaves - 1) / remaining_leaves;
+                avg.min(max_leaf_entries)
+            };
+
+            // Add entries to this leaf
+            for _ in 0..entries_for_this_leaf {
+                if entry_idx >= total_entries {
+                    break;
+                }
+                let (key, value) = all_entries[entry_idx];
+                current_leaf.keys.push(key);
+                current_leaf.values.push(value);
+                self.entry_count += 1;
+                entry_idx += 1;
+            }
+
+            if !current_leaf.is_empty() {
                 let leaf_id = self.allocate_node(BPlusNode::Leaf(current_leaf));
                 leaves.push(leaf_id);
-                current_leaf = LeafNode::new();
             }
-        }
-
-        // Handle the last partially-filled leaf
-        if !current_leaf.is_empty() {
-            let leaf_id = self.allocate_node(BPlusNode::Leaf(current_leaf));
-            leaves.push(leaf_id);
-        }
-
-        // Handle empty tree
-        if leaves.is_empty() {
-            return Ok(());
         }
 
         // Link leaves together
@@ -635,13 +658,39 @@ impl BPlusTree {
         while current_level.len() > 1 {
             let mut next_level: Vec<NodeId> = Vec::new();
             let mut i = 0;
+            let min_internal_children = self.min_internal_children();
 
             while i < current_level.len() {
                 let mut keys = Vec::new();
                 let mut children = Vec::new();
 
-                // Collect up to max_internal_children nodes
-                let end = (i + max_internal_children).min(current_level.len());
+                // Calculate how many children to put in this node
+                let remaining = current_level.len() - i;
+
+                let num_children = if remaining <= max_internal_children {
+                    // Last node in this level - take all remaining
+                    remaining
+                } else {
+                    // Check if taking max_internal_children would leave too few for next node
+                    let would_remain = remaining - max_internal_children;
+
+                    if would_remain > 0 && would_remain < min_internal_children {
+                        // Would violate minimum constraint on next node
+                        // Split more evenly: give some to this node, some to next
+                        // Ensure both nodes meet minimum constraint
+                        let total_for_last_two = remaining;
+                        // Try to distribute evenly while respecting min/max constraints
+                        let first_half = (total_for_last_two + 1) / 2; // Round up
+                        first_half
+                            .min(max_internal_children)
+                            .max(min_internal_children)
+                    } else {
+                        max_internal_children
+                    }
+                };
+
+                // Collect children
+                let end = i + num_children;
                 for &child_id in &current_level[i..end] {
                     let child_max_key = self
                         .get_node(child_id)
@@ -1280,6 +1329,195 @@ mod tests {
         RecordId::new(page, slot)
     }
 
+    /// Comprehensive B+ tree structure validator
+    ///
+    /// Validates all B+ tree constraints:
+    /// 1. Node size constraints (min/max children/entries)
+    /// 2. Key ordering within nodes
+    /// 3. Parent-child key relationships
+    /// 4. Leaf linkage
+    /// 5. All leaves at same depth
+    fn validate_btree_structure(tree: &BPlusTree) -> Result<(), String> {
+        if tree.is_empty() {
+            return Ok(());
+        }
+
+        let root_id = tree.root_node_id().ok_or("Tree has no root")?;
+
+        // Track all leaf depths to ensure they're all the same
+        let mut leaf_depths = Vec::new();
+
+        // Validate recursively from root
+        validate_node(tree, root_id, None, 0, &mut leaf_depths)?;
+
+        // Check all leaves are at same depth
+        if !leaf_depths.is_empty() {
+            let first_depth = leaf_depths[0];
+            if !leaf_depths.iter().all(|&d| d == first_depth) {
+                return Err(format!("Leaves at different depths: {:?}", leaf_depths));
+            }
+        }
+
+        // Validate leaf linkage
+        validate_leaf_chain(tree)?;
+
+        Ok(())
+    }
+
+    fn validate_node(
+        tree: &BPlusTree,
+        node_id: NodeId,
+        parent_id: Option<NodeId>,
+        depth: usize,
+        leaf_depths: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        let node = tree
+            .get_node(node_id)
+            .ok_or(format!("Node {} not found", node_id))?;
+
+        match node {
+            BPlusNode::Leaf(leaf) => {
+                // Record depth
+                leaf_depths.push(depth);
+
+                // Check size constraints
+                let is_root = parent_id.is_none();
+                if !is_root && leaf.len() < tree.min_leaf_entries() {
+                    return Err(format!(
+                        "Leaf node {} has {} entries, min is {}",
+                        node_id,
+                        leaf.len(),
+                        tree.min_leaf_entries()
+                    ));
+                }
+                if leaf.len() > tree.max_leaf_entries() {
+                    return Err(format!(
+                        "Leaf node {} has {} entries, max is {}",
+                        node_id,
+                        leaf.len(),
+                        tree.max_leaf_entries()
+                    ));
+                }
+
+                // Check key ordering
+                for i in 1..leaf.keys.len() {
+                    if leaf.keys[i] < leaf.keys[i - 1] {
+                        return Err(format!(
+                            "Leaf node {} has unsorted keys: {:?}",
+                            node_id, leaf.keys
+                        ));
+                    }
+                }
+
+                Ok(())
+            }
+            BPlusNode::Internal(internal) => {
+                // Check size constraints
+                let is_root = parent_id.is_none();
+                if !is_root && internal.len() < tree.min_internal_children() {
+                    return Err(format!(
+                        "Internal node {} has {} children, min is {}",
+                        node_id,
+                        internal.len(),
+                        tree.min_internal_children()
+                    ));
+                }
+                if is_root && internal.len() < 2 && !tree.is_empty() {
+                    return Err(format!(
+                        "Root internal node {} has {} children, min is 2",
+                        node_id,
+                        internal.len()
+                    ));
+                }
+                if internal.len() > tree.max_internal_children() {
+                    return Err(format!(
+                        "Internal node {} has {} children, max is {}",
+                        node_id,
+                        internal.len(),
+                        tree.max_internal_children()
+                    ));
+                }
+
+                // Check keys match children count
+                if internal.keys.len() != internal.children.len() {
+                    return Err(format!(
+                        "Internal node {} has {} keys but {} children",
+                        node_id,
+                        internal.keys.len(),
+                        internal.children.len()
+                    ));
+                }
+
+                // Check key ordering
+                for i in 1..internal.keys.len() {
+                    if internal.keys[i] < internal.keys[i - 1] {
+                        return Err(format!(
+                            "Internal node {} has unsorted keys: {:?}",
+                            node_id, internal.keys
+                        ));
+                    }
+                }
+
+                // Validate each child and check parent-child key relationship
+                for (i, &child_id) in internal.children.iter().enumerate() {
+                    // Recursively validate child
+                    validate_node(tree, child_id, Some(node_id), depth + 1, leaf_depths)?;
+
+                    // Check that parent's key matches child's max key
+                    let child_max = tree
+                        .get_node(child_id)
+                        .and_then(|n| n.max_key())
+                        .ok_or(format!("Child {} has no max key", child_id))?;
+
+                    if internal.keys[i] != child_max {
+                        return Err(format!(
+                            "Internal node {} key[{}] = {}, but child {} max = {}",
+                            node_id, i, internal.keys[i], child_id, child_max
+                        ));
+                    }
+                }
+
+                Ok(())
+            }
+        }
+    }
+
+    fn validate_leaf_chain(tree: &BPlusTree) -> Result<(), String> {
+        let mut current_id = tree.first_leaf_id();
+        let mut visited = std::collections::HashSet::new();
+        let mut prev_max_key: Option<i64> = None;
+
+        while let Some(id) = current_id {
+            // Check for cycles
+            if visited.contains(&id) {
+                return Err(format!("Cycle detected in leaf chain at node {}", id));
+            }
+            visited.insert(id);
+
+            let leaf = tree
+                .get_node(id)
+                .and_then(|n| n.as_leaf())
+                .ok_or(format!("Leaf {} not found or not a leaf", id))?;
+
+            // Check ordering between leaves
+            if let Some(prev_max) = prev_max_key {
+                if let Some(curr_min) = leaf.min_key() {
+                    if curr_min < prev_max {
+                        return Err(format!(
+                            "Leaf chain out of order: prev max = {}, curr min = {}",
+                            prev_max, curr_min
+                        ));
+                    }
+                }
+            }
+
+            prev_max_key = leaf.max_key();
+            current_id = leaf.next;
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn test_new_tree() {
         let tree = BPlusTree::new(4).unwrap();
@@ -1875,5 +2113,225 @@ mod tests {
         // Verify sorted order via iterator
         let first = tree.iter().next().unwrap();
         assert_eq!(first.0, -50);
+    }
+
+    #[test]
+    fn test_btree_constraints_after_bulk_load_small() {
+        let mut tree = BPlusTree::new(4).unwrap();
+        let entries: Vec<(i64, RecordId)> = (0..10).map(|i| (i * 10, rid(1, i as usize))).collect();
+
+        tree.bulk_load(entries.into_iter()).unwrap();
+
+        // Validate all B+ tree constraints
+        validate_btree_structure(&tree).expect("Tree structure validation failed");
+    }
+
+    #[test]
+    fn test_btree_constraints_after_bulk_load_medium() {
+        let mut tree = BPlusTree::new(10).unwrap();
+        let entries: Vec<(i64, RecordId)> = (0..100)
+            .map(|i| (i, rid(i as usize / 10, i as usize % 10)))
+            .collect();
+
+        tree.bulk_load(entries.into_iter()).unwrap();
+
+        // Validate all B+ tree constraints
+        validate_btree_structure(&tree).expect("Tree structure validation failed");
+    }
+
+    #[test]
+    fn test_btree_constraints_after_bulk_load_large() {
+        let mut tree = BPlusTree::new(50).unwrap();
+        let entries: Vec<(i64, RecordId)> = (0..1000)
+            .map(|i| (i, rid(i as usize / 100, i as usize % 100)))
+            .collect();
+
+        tree.bulk_load(entries.into_iter()).unwrap();
+
+        // Validate all B+ tree constraints
+        validate_btree_structure(&tree).expect("Tree structure validation failed");
+
+        // Additional checks
+        assert!(tree.height() >= 2, "Should be multi-level tree");
+    }
+
+    #[test]
+    fn test_btree_constraints_after_bulk_load_very_large() {
+        let mut tree = BPlusTree::new(500).unwrap();
+        let entries: Vec<(i64, RecordId)> = (0..10000)
+            .map(|i| (i, rid(i as usize / 100, i as usize % 100)))
+            .collect();
+
+        tree.bulk_load(entries.into_iter()).unwrap();
+
+        // Validate all B+ tree constraints
+        validate_btree_structure(&tree).expect("Tree structure validation failed");
+
+        // Additional checks
+        assert!(tree.height() >= 2, "Should be multi-level tree");
+        assert_eq!(tree.len(), 10000);
+    }
+
+    #[test]
+    fn test_btree_constraints_exact_leaf_capacity() {
+        // Test with exactly max_leaf_entries
+        let mut tree = BPlusTree::new(4).unwrap();
+        let max_entries = tree.max_leaf_entries(); // 3 for order 4
+
+        let entries: Vec<(i64, RecordId)> =
+            (0..max_entries).map(|i| (i as i64, rid(1, i))).collect();
+
+        tree.bulk_load(entries.into_iter()).unwrap();
+
+        validate_btree_structure(&tree).expect("Tree structure validation failed");
+
+        // Should fit in single leaf
+        assert_eq!(tree.height(), 1);
+    }
+
+    #[test]
+    fn test_btree_constraints_one_over_leaf_capacity() {
+        // Test with max_leaf_entries + 1 (forces split)
+        let mut tree = BPlusTree::new(4).unwrap();
+        let max_entries = tree.max_leaf_entries(); // 3 for order 4
+
+        let entries: Vec<(i64, RecordId)> =
+            (0..=max_entries).map(|i| (i as i64, rid(1, i))).collect();
+
+        tree.bulk_load(entries.into_iter()).unwrap();
+
+        validate_btree_structure(&tree).expect("Tree structure validation failed");
+
+        // Should have 2 levels
+        assert_eq!(tree.height(), 2);
+    }
+
+    #[test]
+    fn test_btree_constraints_with_duplicates() {
+        let mut tree = BPlusTree::new(5).unwrap();
+        let mut entries = Vec::new();
+
+        // Add duplicates at various points
+        for i in 0..20 {
+            entries.push((i, rid(i as usize, 0)));
+            if i % 5 == 0 {
+                entries.push((i, rid(i as usize, 1)));
+                entries.push((i, rid(i as usize, 2)));
+            }
+        }
+
+        tree.bulk_load(entries.into_iter()).unwrap();
+
+        validate_btree_structure(&tree).expect("Tree structure validation failed");
+    }
+
+    #[test]
+    fn test_btree_constraints_after_individual_inserts() {
+        // Compare: bulk load should produce same constraints as individual inserts
+        let mut tree = BPlusTree::new(10).unwrap();
+
+        // Individual inserts
+        for i in 0..50 {
+            tree.insert(i, rid(1, i as usize)).unwrap();
+        }
+
+        validate_btree_structure(&tree).expect("Tree structure validation failed after inserts");
+    }
+
+    #[test]
+    fn test_btree_constraints_boundary_cases() {
+        // Test various tree sizes around boundary conditions
+        for order in [4, 5, 10, 50] {
+            for size in [1, 2, 10, 50, 100] {
+                let mut tree = BPlusTree::new(order).unwrap();
+                let entries: Vec<(i64, RecordId)> =
+                    (0..size).map(|i| (i, rid(1, i as usize))).collect();
+
+                tree.bulk_load(entries.into_iter()).unwrap();
+
+                validate_btree_structure(&tree).unwrap_or_else(|e| {
+                    panic!(
+                        "Validation failed for order={}, size={}: {}",
+                        order, size, e
+                    )
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn test_node_size_constraints_maintained() {
+        // Specifically test that no node violates size constraints
+        let mut tree = BPlusTree::new(10).unwrap();
+        let entries: Vec<(i64, RecordId)> = (0..200).map(|i| (i, rid(1, i as usize))).collect();
+
+        tree.bulk_load(entries.into_iter()).unwrap();
+
+        // Walk through all nodes and verify constraints
+        let root_id = tree.root_node_id().unwrap();
+        let mut to_check = vec![root_id];
+        let mut visited = std::collections::HashSet::new();
+
+        while let Some(node_id) = to_check.pop() {
+            if visited.contains(&node_id) {
+                continue;
+            }
+            visited.insert(node_id);
+
+            let node = tree.get_node(node_id).unwrap();
+
+            match node {
+                BPlusNode::Leaf(leaf) => {
+                    // Leaf must have <= max_leaf_entries
+                    assert!(
+                        leaf.len() <= tree.max_leaf_entries(),
+                        "Leaf has {} entries, max is {}",
+                        leaf.len(),
+                        tree.max_leaf_entries()
+                    );
+
+                    // Non-root leaves must have >= min_leaf_entries
+                    if node_id != root_id {
+                        assert!(
+                            leaf.len() >= tree.min_leaf_entries(),
+                            "Non-root leaf has {} entries, min is {}",
+                            leaf.len(),
+                            tree.min_leaf_entries()
+                        );
+                    }
+                }
+                BPlusNode::Internal(internal) => {
+                    // Internal must have <= max_internal_children
+                    assert!(
+                        internal.len() <= tree.max_internal_children(),
+                        "Internal has {} children, max is {}",
+                        internal.len(),
+                        tree.max_internal_children()
+                    );
+
+                    // Root must have >= 2 children (if not a leaf)
+                    if node_id == root_id {
+                        assert!(
+                            internal.len() >= 2,
+                            "Root internal has {} children, min is 2",
+                            internal.len()
+                        );
+                    } else {
+                        // Non-root internal must have >= min_internal_children
+                        assert!(
+                            internal.len() >= tree.min_internal_children(),
+                            "Non-root internal has {} children, min is {}",
+                            internal.len(),
+                            tree.min_internal_children()
+                        );
+                    }
+
+                    // Add children to check
+                    for &child_id in &internal.children {
+                        to_check.push(child_id);
+                    }
+                }
+            }
+        }
     }
 }
