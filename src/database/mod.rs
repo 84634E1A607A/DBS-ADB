@@ -652,7 +652,7 @@ impl DatabaseManager {
         table: &str,
         delimiter: char,
     ) -> DatabaseResult<usize> {
-        // Get table metadata to know column types
+        // Get table metadata to know column types and indexes
         let table_meta = {
             let metadata = self
                 .current_metadata
@@ -661,6 +661,49 @@ impl DatabaseManager {
             metadata.get_table(table)?.clone()
         };
 
+        let db_name = self.current_db.as_ref().unwrap();
+        let db_path = self.data_dir.join(db_name);
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        // Step 1: Collect all index information before dropping
+        let mut index_columns = Vec::new();
+
+        // Add primary key index(es) if exists
+        if let Some(ref pk_cols) = table_meta.primary_key {
+            for col_name in pk_cols {
+                index_columns.push(col_name.clone());
+            }
+        }
+
+        // Add other indexes (indexes may be on multiple columns, take first for single-column indexes)
+        for index_meta in &table_meta.indexes {
+            for col_name in &index_meta.columns {
+                if !index_columns.contains(col_name) {
+                    index_columns.push(col_name.clone());
+                }
+            }
+        }
+
+        // Step 2: Drop all indexes (including primary key index)
+        for col_name in &index_columns {
+            // Attempt to drop - ignore error if index doesn't exist
+            let _ = self.index_manager.drop_index(&db_path_str, table, col_name);
+        }
+
+        // Step 3: Clear all data from the table
+        // Scan and collect all record IDs, then delete them
+        let record_ids: Vec<_> = self
+            .record_manager
+            .scan(table)?
+            .into_iter()
+            .map(|(rid, _)| rid)
+            .collect();
+
+        for rid in record_ids {
+            self.record_manager.delete(table, rid)?;
+        }
+
+        // Step 4: Load data without index maintenance
         // Use csv crate for efficient parsing
         let mut reader = ReaderBuilder::new()
             .delimiter(delimiter as u8)
@@ -723,6 +766,39 @@ impl DatabaseManager {
         // Insert remaining rows
         if !batch_rows.is_empty() {
             total_inserted += self.bulk_insert(table, batch_rows, true)?;
+        }
+
+        // Step 5: Reconstruct all indexes using bulk create
+        for col_name in &index_columns {
+            // Find the column index
+            let col_idx = table_meta
+                .columns
+                .iter()
+                .position(|c| &c.name == col_name)
+                .ok_or_else(|| {
+                    DatabaseError::ColumnNotFound(col_name.clone(), table.to_string())
+                })?;
+
+            // Scan table and extract values for this column
+            let records = self.record_manager.scan(table)?;
+            let table_data: Vec<_> = records
+                .into_iter()
+                .filter_map(|(rid, record)| {
+                    if let crate::record::Value::Int(val) = record.get(col_idx).unwrap() {
+                        Some((rid, *val as i64))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Use bulk create index function
+            self.index_manager.create_index_from_table(
+                &db_path_str,
+                table,
+                col_name,
+                table_data.into_iter(),
+            )?;
         }
 
         Ok(total_inserted)
