@@ -1,5 +1,6 @@
+use ahash::AHashMap;
 use lru::LruCache;
-use std::collections::HashMap;
+use std::mem;
 use std::num::NonZeroUsize;
 
 use super::error::{FileError, FileResult};
@@ -25,12 +26,14 @@ struct BufferEntry {
 pub struct BufferManager {
     /// Underlying file manager
     file_manager: PagedFileManager,
-    /// Buffer pool: stores actual page data
-    buffer_pool: HashMap<BufferKey, BufferEntry>,
+    /// Buffer pool: stores actual page data (using AHashMap for fast lookups)
+    buffer_pool: AHashMap<BufferKey, BufferEntry>,
     /// LRU cache for tracking page access order
     lru_cache: LruCache<BufferKey, ()>,
     /// Maximum size of the buffer pool
     max_pool_size: usize,
+    /// Reusable buffer for loading pages (avoids allocation on every load)
+    load_buffer: Vec<u8>,
 }
 
 impl BufferManager {
@@ -43,9 +46,10 @@ impl BufferManager {
     pub fn with_capacity(file_manager: PagedFileManager, capacity: usize) -> Self {
         Self {
             file_manager,
-            buffer_pool: HashMap::new(),
+            buffer_pool: AHashMap::new(),
             lru_cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
             max_pool_size: capacity,
+            load_buffer: vec![0u8; PAGE_SIZE], // Allocate once, reuse for all page loads
         }
     }
 
@@ -111,13 +115,12 @@ impl BufferManager {
     pub fn flush_page(&mut self, file: FileHandle, page_id: PageId) -> FileResult<()> {
         let key = BufferKey { file, page_id };
 
-        if let Some(entry) = self.buffer_pool.get_mut(&key) {
-            if entry.dirty {
-                self.file_manager.write_page(file, page_id, &entry.data)?;
-                entry.dirty = false;
-            }
+        if let Some(entry) = self.buffer_pool.get_mut(&key)
+            && entry.dirty
+        {
+            self.file_manager.write_page(file, page_id, &entry.data)?;
+            entry.dirty = false;
         }
-
         Ok(())
     }
 
@@ -138,6 +141,19 @@ impl BufferManager {
 
         // Sync all files to ensure data is persisted to disk
         self.file_manager.sync_all()?;
+
+        Ok(())
+    }
+
+    /// Flush all dirty pages and clear the entire buffer pool
+    /// This releases all cached memory - use when memory is constrained
+    pub fn flush_and_clear(&mut self) -> FileResult<()> {
+        // Flush all dirty pages first
+        self.flush_all()?;
+
+        // Clear both the buffer pool and LRU cache
+        self.buffer_pool.clear();
+        self.lru_cache.clear();
 
         Ok(())
     }
@@ -168,11 +184,19 @@ impl BufferManager {
             self.evict_lru_page()?;
         }
 
-        // Load page from disk
-        let mut data = vec![0u8; PAGE_SIZE];
-        self.file_manager.read_page(file, page_id, &mut data)?;
+        // Ensure load_buffer has correct capacity (in case it was never initialized or shrunk)
+        if self.load_buffer.len() != PAGE_SIZE {
+            self.load_buffer = vec![0u8; PAGE_SIZE];
+        }
 
-        // Add to buffer pool
+        // Load page from disk into reusable buffer (no allocation!)
+        self.file_manager
+            .read_page(file, page_id, &mut self.load_buffer)?;
+
+        // Move the loaded data into buffer pool using mem::replace
+        // This swaps ownership without copying - the buffer moves into the pool
+        // and we get back an empty Vec (which will be replaced on next eviction or reused)
+        let data = std::mem::take(&mut self.load_buffer);
         self.buffer_pool
             .insert(key, BufferEntry { data, dirty: false });
 
@@ -186,9 +210,14 @@ impl BufferManager {
     fn evict_lru_page(&mut self) -> FileResult<()> {
         // Find and remove the LRU page from the LRU cache
         if let Some((key, _)) = self.lru_cache.pop_lru() {
-            // Flush if dirty and remove from buffer pool
+            // Flush if dirty
             self.flush_page(key.file, key.page_id)?;
-            self.buffer_pool.remove(&key);
+
+            // Recycle the evicted buffer for future page loads (avoid allocation)
+            if let Some(entry) = self.buffer_pool.remove(&key) {
+                // Reuse this buffer - it's already PAGE_SIZE, no need to reallocate
+                self.load_buffer = entry.data;
+            }
         }
 
         Ok(())

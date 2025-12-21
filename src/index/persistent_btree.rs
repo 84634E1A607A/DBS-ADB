@@ -251,6 +251,18 @@ impl PersistentBPlusTree {
         Ok(())
     }
 
+    /// Bulk load from pre-sorted slice (more memory efficient)
+    pub fn bulk_load_from_slice(&mut self, entries: &[(i64, RecordId)]) -> IndexResult<()> {
+        // Perform bulk load on the tree from slice
+        self.tree.bulk_load_from_slice(entries)?;
+
+        // Mark everything as dirty since we rebuilt the tree
+        self.metadata_dirty = true;
+        self.mark_all_nodes_dirty();
+
+        Ok(())
+    }
+
     /// Delete all entries with the given key
     /// Returns whether any entries were deleted
     pub fn delete(&mut self, key: i64) -> IndexResult<bool> {

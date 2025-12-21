@@ -10,6 +10,8 @@ pub use file_manager::{FileHandle, PagedFileManager};
 pub const PAGE_SIZE: usize = 8192;
 
 /// Number of pages in the buffer pool
+/// With 3000 pages × 8KB = 24MB, leaving room for other data structures
+/// in systems with 256MB memory limit
 pub const BUFFER_POOL_SIZE: usize = 10000;
 
 /// Page ID type

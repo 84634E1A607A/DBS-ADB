@@ -51,6 +51,9 @@ pub enum DatabaseError {
     #[error("Index error: {0}")]
     IndexError(#[from] crate::index::IndexError),
 
+    #[error("File error: {0}")]
+    FileError(#[from] crate::file::FileError),
+
     #[error("Primary key violation: duplicate key value")]
     PrimaryKeyViolation,
 
@@ -709,6 +712,11 @@ impl DatabaseManager {
         self.record_manager
             .create_table(&table_path_str, schema.clone())?;
 
+        eprintln!(
+            "Cleared all data from table {} by recreating the table file",
+            table
+        );
+
         // Step 4: Load data without index maintenance
         // Use csv crate for efficient parsing
         let mut reader = ReaderBuilder::new()
@@ -726,8 +734,7 @@ impl DatabaseManager {
 
         // Process records in batches - use schema to parse types directly
         for result in reader.records() {
-            let record = result
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            let record = result.map_err(|e| std::io::Error::other(e.to_string()))?;
 
             let mut values = Vec::with_capacity(num_columns);
             for (idx, field) in record.iter().enumerate() {
@@ -763,8 +770,9 @@ impl DatabaseManager {
 
                 // Insert batch when it reaches BATCH_SIZE
                 if batch_rows.len() >= BATCH_SIZE {
-                    total_inserted += self.bulk_insert(table, batch_rows, true)?;
-                    batch_rows = Vec::with_capacity(BATCH_SIZE); // Reset for next batch
+                    total_inserted +=
+                        self.bulk_insert(table, std::mem::take(&mut batch_rows), true)?;
+                    batch_rows.reserve(BATCH_SIZE); // Prepare for next batch
                 }
             }
         }
@@ -773,6 +781,11 @@ impl DatabaseManager {
         if !batch_rows.is_empty() {
             total_inserted += self.bulk_insert(table, batch_rows, true)?;
         }
+
+        eprintln!(
+            "Loaded data from file {} into table {} without indexes",
+            file_path, table
+        );
 
         // Step 5: Reconstruct all indexes using bulk create
         for col_name in &index_columns {
@@ -803,6 +816,10 @@ impl DatabaseManager {
                 col_name,
                 table_data,
             )?;
+
+            // Flush and clear buffer pool after each index creation
+            // This releases ALL cached pages to prevent memory buildup
+            self.buffer_manager.lock().unwrap().flush_and_clear()?;
         }
 
         // Step 6: Close all indexes to release memory

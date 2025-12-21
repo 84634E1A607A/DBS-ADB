@@ -24,13 +24,9 @@ impl TableFile {
         buffer_mgr.file_manager_mut().create_file(path)?;
         let file_handle = buffer_mgr.file_manager_mut().open_file(path)?;
 
-        // Create the first page
-        let page = Page::new(schema.record_size())?;
-        let page_bytes = page.to_bytes();
-
-        // Write the first page
+        // Create the first page - zero-copy directly in buffer
         let page_buffer = buffer_mgr.get_page_mut(file_handle, 0)?;
-        page_buffer.copy_from_slice(&page_bytes);
+        Page::new(page_buffer, schema.record_size())?;
 
         Ok(Self {
             file_handle,
@@ -88,17 +84,14 @@ impl TableFile {
         loop {
             // Load the page directly as mutable (avoid double load)
             let page_buffer = buffer_mgr.get_page_mut(self.file_handle, page_id)?;
-            let mut page = Page::from_bytes(page_buffer)?;
+            let mut page = Page::from_buffer(page_buffer)?;
 
             // Check if page has free space
             if let Some(slot_id) = page.find_free_slot() {
                 // Found free slot, insert record
                 page.set_record(slot_id, &record_bytes)?;
                 page.mark_slot_used(slot_id)?;
-
-                // Write page back (buffer is already mutable)
-                let page_bytes = page.to_bytes();
-                page_buffer.copy_from_slice(&page_bytes);
+                // No need to write back - page modified buffer in-place!
 
                 // Update last insert location for next time
                 self.last_insert_page_id = page_id;
@@ -133,17 +126,12 @@ impl TableFile {
         buffer_mgr: &mut BufferManager,
         rid: RecordId,
     ) -> RecordResult<()> {
-        // Load the page
-        let page_buffer = buffer_mgr.get_page(self.file_handle, rid.page_id)?;
-        let mut page = Page::from_bytes(page_buffer)?;
-
-        // Mark slot as free
-        page.mark_slot_free(rid.slot_id)?;
-
-        // Write page back
-        let page_bytes = page.to_bytes();
+        // Load the page as mutable
         let page_buffer = buffer_mgr.get_page_mut(self.file_handle, rid.page_id)?;
-        page_buffer.copy_from_slice(&page_bytes);
+        let mut page = Page::from_buffer(page_buffer)?;
+
+        // Mark slot as free (modifies buffer in-place)
+        page.mark_slot_free(rid.slot_id)?;
 
         Ok(())
     }
@@ -161,17 +149,12 @@ impl TableFile {
         // Serialize record
         let record_bytes = record.serialize(&self.schema)?;
 
-        // Load the page
-        let page_buffer = buffer_mgr.get_page(self.file_handle, rid.page_id)?;
-        let mut page = Page::from_bytes(page_buffer)?;
-
-        // Update record in slot
-        page.set_record(rid.slot_id, &record_bytes)?;
-
-        // Write page back
-        let page_bytes = page.to_bytes();
+        // Load the page as mutable
         let page_buffer = buffer_mgr.get_page_mut(self.file_handle, rid.page_id)?;
-        page_buffer.copy_from_slice(&page_bytes);
+        let mut page = Page::from_buffer(page_buffer)?;
+
+        // Update record in slot (modifies buffer in-place)
+        page.set_record(rid.slot_id, &record_bytes)?;
 
         Ok(())
     }
@@ -182,9 +165,10 @@ impl TableFile {
         buffer_mgr: &mut BufferManager,
         rid: RecordId,
     ) -> RecordResult<Record> {
-        // Load the page
-        let page_buffer = buffer_mgr.get_page(self.file_handle, rid.page_id)?;
-        let page = Page::from_bytes(page_buffer)?;
+        // Load the page - for reads we need to work around immutable borrow
+        // We'll use get_page_mut but treat it as read-only
+        let page_buffer = buffer_mgr.get_page_mut(self.file_handle, rid.page_id)?;
+        let page = Page::from_buffer(page_buffer)?;
 
         // Get record bytes
         let record_bytes = page.get_record(rid.slot_id)?;
@@ -207,9 +191,9 @@ impl TableFile {
                 break;
             }
 
-            // Load the page
-            let page_buffer = buffer_mgr.get_page(self.file_handle, page_id)?;
-            let page = Page::from_bytes(page_buffer)?;
+            // Load the page - use get_page_mut for consistency
+            let page_buffer = buffer_mgr.get_page_mut(self.file_handle, page_id)?;
+            let page = Page::from_buffer(page_buffer)?;
 
             // Scan all slots in this page
             for slot_id in 0..page.slot_count() {
@@ -240,21 +224,14 @@ impl TableFile {
         let new_page_id = self.page_count;
         self.page_count += 1;
 
-        // Create new page
-        let new_page = Page::new(self.schema.record_size())?;
-        let new_page_bytes = new_page.to_bytes();
-
-        // Write new page
+        // Create new page directly in buffer
         let page_buffer = buffer_mgr.get_page_mut(self.file_handle, new_page_id)?;
-        page_buffer.copy_from_slice(&new_page_bytes);
+        Page::new(page_buffer, self.schema.record_size())?;
 
-        // Update previous page's next_page pointer (use get_page_mut directly)
+        // Update previous page's next_page pointer
         let prev_page_buffer = buffer_mgr.get_page_mut(self.file_handle, prev_page_id)?;
-        let mut prev_page = Page::from_bytes(prev_page_buffer)?;
+        let mut prev_page = Page::from_buffer(prev_page_buffer)?;
         prev_page.set_next_page(new_page_id);
-
-        let prev_page_bytes = prev_page.to_bytes();
-        prev_page_buffer.copy_from_slice(&prev_page_bytes);
 
         Ok(new_page_id)
     }

@@ -567,6 +567,16 @@ impl BPlusTree {
     where
         I: Iterator<Item = (BPlusKey, RecordId)>,
     {
+        // Collect entries into a Vec - we need random access for bulk loading
+        let all_entries: Vec<(BPlusKey, RecordId)> = entries.collect();
+        self.bulk_load_from_slice(&all_entries)
+    }
+
+    /// Bulk load from a pre-sorted slice (more memory efficient)
+    pub fn bulk_load_from_slice(
+        &mut self,
+        all_entries: &[(BPlusKey, RecordId)],
+    ) -> BPlusTreeResult<()> {
         // Clear existing tree
         self.root = None;
         self.nodes.clear();
@@ -577,9 +587,6 @@ impl BPlusTree {
         let max_leaf_entries = self.max_leaf_entries();
         let min_leaf_entries = self.min_leaf_entries();
         let max_internal_children = self.max_internal_children();
-
-        // Collect all entries first to know total count
-        let all_entries: Vec<(BPlusKey, RecordId)> = entries.collect();
 
         if all_entries.is_empty() {
             return Ok(());

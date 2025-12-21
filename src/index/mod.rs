@@ -145,10 +145,13 @@ impl IndexManager {
             DEFAULT_ORDER,
         )?;
 
-        // Use bulk load for efficient tree construction
-        // Note: bulk_load will also collect the iterator, but we've already
-        // collected and sorted, so we pass in an iterator over our vec
-        index_file.bulk_load(entries.into_iter())?;
+        // Use bulk load from slice to avoid re-collecting the data
+        // We pass a slice to avoid the double allocation that would happen
+        // if bulk_load collected the iterator again
+        index_file.bulk_load_from_slice(&entries)?;
+
+        // Explicitly drop entries to free memory before flushing
+        drop(entries);
 
         // Flush to disk
         index_file.flush(&mut *buffer_manager)?;

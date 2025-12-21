@@ -57,14 +57,14 @@ impl PageHeader {
     }
 }
 
-/// In-memory representation of a page
-pub struct Page {
-    header: PageHeader,
-    slot_bitmap: Vec<u8>, // Bitmap tracking used/free slots
-    data: Vec<u8>,        // Record data area
+/// Zero-copy page wrapper that operates directly on buffer pool memory
+/// This avoids the costly allocation and copying that was the main performance bottleneck
+pub struct Page<'a> {
+    buffer: &'a mut [u8], // Direct reference to buffer pool page (PAGE_SIZE bytes)
+    header: PageHeader,   // Cached header for fast access
 }
 
-impl Page {
+impl<'a> Page<'a> {
     /// Calculate maximum number of slots for a given record size
     pub fn calculate_slot_count(record_size: usize) -> usize {
         if record_size == 0 || record_size > PAGE_SIZE {
@@ -83,8 +83,17 @@ impl Page {
         max_slots.min(u16::MAX as usize)
     }
 
-    /// Create a new empty page
-    pub fn new(record_size: usize) -> RecordResult<Self> {
+    /// Create a new empty page in the provided buffer
+    /// The buffer must be exactly PAGE_SIZE bytes
+    pub fn new(buffer: &'a mut [u8], record_size: usize) -> RecordResult<Self> {
+        if buffer.len() != PAGE_SIZE {
+            return Err(RecordError::Deserialization(format!(
+                "Buffer must be PAGE_SIZE ({}) bytes, got {}",
+                PAGE_SIZE,
+                buffer.len()
+            )));
+        }
+
         let slot_count = Self::calculate_slot_count(record_size);
         if slot_count == 0 {
             return Err(RecordError::InvalidRecord(format!(
@@ -93,18 +102,20 @@ impl Page {
             )));
         }
 
-        let bitmap_size = slot_count.div_ceil(8);
-        let data_size = slot_count * record_size;
+        let header = PageHeader::new(slot_count as u16, record_size as u16);
 
-        Ok(Self {
-            header: PageHeader::new(slot_count as u16, record_size as u16),
-            slot_bitmap: vec![0u8; bitmap_size],
-            data: vec![0u8; data_size],
-        })
+        // Zero out the entire buffer
+        buffer.fill(0);
+
+        // Write header directly to buffer
+        buffer[..PageHeader::SIZE].copy_from_slice(&header.serialize());
+
+        Ok(Self { buffer, header })
     }
 
-    /// Deserialize page from buffer
-    pub fn from_bytes(buffer: &[u8]) -> RecordResult<Self> {
+    /// Wrap an existing page buffer (zero-copy)
+    /// This replaces the old from_bytes that allocated Vecs
+    pub fn from_buffer(buffer: &'a mut [u8]) -> RecordResult<Self> {
         if buffer.len() != PAGE_SIZE {
             return Err(RecordError::Deserialization(format!(
                 "Invalid page size: {} bytes",
@@ -117,11 +128,11 @@ impl Page {
         let slot_count = header.slot_count as usize;
         let record_size = header.record_size as usize;
         let bitmap_size = slot_count.div_ceil(8);
+        let data_size = slot_count * record_size;
 
         let bitmap_start = PageHeader::SIZE;
-        let bitmap_end = bitmap_start + bitmap_size;
-        let data_start = bitmap_end;
-        let data_end = data_start + (slot_count * record_size);
+        let data_start = bitmap_start + bitmap_size;
+        let data_end = data_start + data_size;
 
         if data_end > PAGE_SIZE {
             return Err(RecordError::Deserialization(
@@ -129,31 +140,45 @@ impl Page {
             ));
         }
 
-        Ok(Self {
-            header,
-            slot_bitmap: buffer[bitmap_start..bitmap_end].to_vec(),
-            data: buffer[data_start..data_end].to_vec(),
-        })
+        Ok(Self { buffer, header })
     }
 
-    /// Serialize page to buffer
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut result = vec![0u8; PAGE_SIZE];
-
-        // Write header
-        result[..PageHeader::SIZE].copy_from_slice(&self.header.serialize());
-
-        // Write bitmap
+    /// Get bitmap slice from buffer
+    fn bitmap_slice(&self) -> &[u8] {
+        let slot_count = self.header.slot_count as usize;
+        let bitmap_size = slot_count.div_ceil(8);
         let bitmap_start = PageHeader::SIZE;
-        let bitmap_end = bitmap_start + self.slot_bitmap.len();
-        result[bitmap_start..bitmap_end].copy_from_slice(&self.slot_bitmap);
+        let bitmap_end = bitmap_start + bitmap_size;
+        &self.buffer[bitmap_start..bitmap_end]
+    }
 
-        // Write data
-        let data_start = bitmap_end;
-        let data_end = data_start + self.data.len();
-        result[data_start..data_end].copy_from_slice(&self.data);
+    /// Get mutable bitmap slice from buffer
+    fn bitmap_slice_mut(&mut self) -> &mut [u8] {
+        let slot_count = self.header.slot_count as usize;
+        let bitmap_size = slot_count.div_ceil(8);
+        let bitmap_start = PageHeader::SIZE;
+        let bitmap_end = bitmap_start + bitmap_size;
+        &mut self.buffer[bitmap_start..bitmap_end]
+    }
 
-        result
+    /// Get data slice from buffer
+    fn data_slice(&self) -> &[u8] {
+        let slot_count = self.header.slot_count as usize;
+        let record_size = self.header.record_size as usize;
+        let bitmap_size = slot_count.div_ceil(8);
+        let data_start = PageHeader::SIZE + bitmap_size;
+        let data_end = data_start + (slot_count * record_size);
+        &self.buffer[data_start..data_end]
+    }
+
+    /// Get mutable data slice from buffer
+    fn data_slice_mut(&mut self) -> &mut [u8] {
+        let slot_count = self.header.slot_count as usize;
+        let record_size = self.header.record_size as usize;
+        let bitmap_size = slot_count.div_ceil(8);
+        let data_start = PageHeader::SIZE + bitmap_size;
+        let data_end = data_start + (slot_count * record_size);
+        &mut self.buffer[data_start..data_end]
     }
 
     /// Find a free slot, returns None if page is full
@@ -169,10 +194,11 @@ impl Page {
     pub fn is_slot_used(&self, slot_id: SlotId) -> bool {
         let byte_idx = slot_id / 8;
         let bit_idx = slot_id % 8;
-        if byte_idx >= self.slot_bitmap.len() {
+        let bitmap = self.bitmap_slice();
+        if byte_idx >= bitmap.len() {
             return false;
         }
-        (self.slot_bitmap[byte_idx] & (1 << bit_idx)) != 0
+        (bitmap[byte_idx] & (1 << bit_idx)) != 0
     }
 
     /// Check if a slot is free
@@ -190,8 +216,11 @@ impl Page {
         let bit_idx = slot_id % 8;
 
         if !self.is_slot_used(slot_id) {
-            self.slot_bitmap[byte_idx] |= 1 << bit_idx;
+            let bitmap = self.bitmap_slice_mut();
+            bitmap[byte_idx] |= 1 << bit_idx;
             self.header.free_slots = self.header.free_slots.saturating_sub(1);
+            // Update header in buffer
+            self.buffer[..PageHeader::SIZE].copy_from_slice(&self.header.serialize());
         }
 
         Ok(())
@@ -207,8 +236,11 @@ impl Page {
         let bit_idx = slot_id % 8;
 
         if self.is_slot_used(slot_id) {
-            self.slot_bitmap[byte_idx] &= !(1 << bit_idx);
+            let bitmap = self.bitmap_slice_mut();
+            bitmap[byte_idx] &= !(1 << bit_idx);
             self.header.free_slots = (self.header.free_slots + 1).min(self.header.slot_count);
+            // Update header in buffer
+            self.buffer[..PageHeader::SIZE].copy_from_slice(&self.header.serialize());
         }
 
         Ok(())
@@ -225,10 +257,11 @@ impl Page {
         }
 
         let record_size = self.header.record_size as usize;
+        let data = self.data_slice();
         let start = slot_id * record_size;
         let end = start + record_size;
 
-        Ok(&self.data[start..end])
+        Ok(&data[start..end])
     }
 
     /// Set record data in a slot
@@ -248,7 +281,8 @@ impl Page {
 
         let start = slot_id * record_size;
         let end = start + record_size;
-        self.data[start..end].copy_from_slice(data);
+        let data_slice = self.data_slice_mut();
+        data_slice[start..end].copy_from_slice(data);
 
         Ok(())
     }
@@ -271,6 +305,8 @@ impl Page {
     /// Set the next page ID
     pub fn set_next_page(&mut self, page_id: PageId) {
         self.header.next_page = page_id as u32;
+        // Update header in buffer
+        self.buffer[..PageHeader::SIZE].copy_from_slice(&self.header.serialize());
     }
 
     /// Check if page is full
@@ -305,7 +341,8 @@ mod tests {
 
     #[test]
     fn test_page_creation() {
-        let page = Page::new(23).unwrap();
+        let mut buffer = vec![0u8; PAGE_SIZE];
+        let page = Page::new(&mut buffer, 23).unwrap();
         assert_eq!(page.slot_count(), Page::calculate_slot_count(23));
         assert_eq!(page.free_slot_count(), page.slot_count());
         assert!(page.is_empty());
@@ -314,7 +351,8 @@ mod tests {
 
     #[test]
     fn test_slot_operations() {
-        let mut page = Page::new(23).unwrap();
+        let mut buffer = vec![0u8; PAGE_SIZE];
+        let mut page = Page::new(&mut buffer, 23).unwrap();
 
         // Initially all slots are free
         assert!(page.is_slot_free(0));
@@ -338,7 +376,8 @@ mod tests {
 
     #[test]
     fn test_find_free_slot() {
-        let mut page = Page::new(23).unwrap();
+        let mut buffer = vec![0u8; PAGE_SIZE];
+        let mut page = Page::new(&mut buffer, 23).unwrap();
 
         // First free slot should be 0
         assert_eq!(page.find_free_slot(), Some(0));
@@ -354,7 +393,8 @@ mod tests {
 
     #[test]
     fn test_record_operations() {
-        let mut page = Page::new(10).unwrap();
+        let mut buffer = vec![0u8; PAGE_SIZE];
+        let mut page = Page::new(&mut buffer, 10).unwrap();
 
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
@@ -369,21 +409,25 @@ mod tests {
 
     #[test]
     fn test_serialization() {
-        let mut page = Page::new(23).unwrap();
+        let mut buffer = vec![0u8; PAGE_SIZE];
+        let mut page = Page::new(&mut buffer, 23).unwrap();
 
         // Mark some slots as used
         page.mark_slot_used(0).unwrap();
         page.mark_slot_used(5).unwrap();
         page.set_next_page(42);
 
-        // Serialize
-        let bytes = page.to_bytes();
-        assert_eq!(bytes.len(), PAGE_SIZE);
+        // Buffer should now contain the serialized page
+        let slot_count_before = page.slot_count();
+        let free_slots_before = page.free_slot_count();
 
-        // Deserialize
-        let restored = Page::from_bytes(&bytes).unwrap();
-        assert_eq!(restored.slot_count(), page.slot_count());
-        assert_eq!(restored.free_slot_count(), page.free_slot_count());
+        // Drop page to release buffer
+        drop(page);
+
+        // Restore from buffer
+        let restored = Page::from_buffer(&mut buffer).unwrap();
+        assert_eq!(restored.slot_count(), slot_count_before);
+        assert_eq!(restored.free_slot_count(), free_slots_before);
         assert_eq!(restored.next_page(), 42);
         assert!(restored.is_slot_used(0));
         assert!(restored.is_slot_used(5));
@@ -392,7 +436,8 @@ mod tests {
 
     #[test]
     fn test_page_full() {
-        let mut page = Page::new(100).unwrap();
+        let mut buffer = vec![0u8; PAGE_SIZE];
+        let mut page = Page::new(&mut buffer, 100).unwrap();
         let slot_count = page.slot_count();
 
         // Fill all slots

@@ -106,6 +106,11 @@ impl IndexFile {
         self.btree.bulk_load(entries)
     }
 
+    /// Bulk load from a pre-sorted slice (more memory efficient)
+    pub fn bulk_load_from_slice(&mut self, entries: &[(i64, RecordId)]) -> IndexResult<()> {
+        self.btree.bulk_load_from_slice(entries)
+    }
+
     /// Delete all entries with the given key
     /// Returns whether any entries were deleted
     pub fn delete(&mut self, key: i64) -> IndexResult<bool> {
