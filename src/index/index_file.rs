@@ -79,6 +79,33 @@ impl IndexFile {
         self.btree.insert(key, rid)
     }
 
+    /// Efficiently build index from pre-sorted entries
+    ///
+    /// This method is significantly faster than repeated individual inserts
+    /// when loading a large amount of data.
+    ///
+    /// # Arguments
+    /// * `entries` - Iterator of (key, value) pairs in ascending key order
+    ///
+    /// # Important
+    /// Entries MUST be sorted by key. Unsorted entries will cause an error.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Collect data from table
+    /// let mut entries: Vec<(i64, RecordId)> = /* scan table */;
+    /// // Sort by key
+    /// entries.sort_by_key(|e| e.0);
+    /// // Bulk load into index
+    /// index_file.bulk_load(entries.into_iter())?;
+    /// ```
+    pub fn bulk_load<I>(&mut self, entries: I) -> IndexResult<()>
+    where
+        I: Iterator<Item = (i64, RecordId)>,
+    {
+        self.btree.bulk_load(entries)
+    }
+
     /// Delete all entries with the given key
     /// Returns whether any entries were deleted
     pub fn delete(&mut self, key: i64) -> IndexResult<bool> {

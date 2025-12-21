@@ -226,6 +226,31 @@ impl PersistentBPlusTree {
         Ok(())
     }
 
+    /// Efficiently build the index from pre-sorted entries
+    ///
+    /// This is significantly faster than repeated individual inserts.
+    /// Entries MUST be sorted by key in ascending order.
+    ///
+    /// # Arguments
+    /// * `entries` - Iterator of (key, value) pairs in ascending key order
+    ///
+    /// # Returns
+    /// * `Ok(())` - Index built successfully
+    /// * `Err(...)` - If entries are not sorted or an error occurs
+    pub fn bulk_load<I>(&mut self, entries: I) -> IndexResult<()>
+    where
+        I: Iterator<Item = (i64, RecordId)>,
+    {
+        // Perform bulk load on the tree
+        self.tree.bulk_load(entries)?;
+
+        // Mark everything as dirty since we rebuilt the tree
+        self.metadata_dirty = true;
+        self.mark_all_nodes_dirty();
+
+        Ok(())
+    }
+
     /// Delete all entries with the given key
     /// Returns whether any entries were deleted
     pub fn delete(&mut self, key: i64) -> IndexResult<bool> {

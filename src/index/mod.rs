@@ -62,6 +62,91 @@ impl IndexManager {
         Ok(())
     }
 
+    /// Create an index on existing table data (efficient bulk loading)
+    ///
+    /// This method scans the table, extracts values from the specified column,
+    /// sorts them, and builds the B+ tree using an efficient bottom-up algorithm.
+    ///
+    /// # Arguments
+    /// * `db_path` - Database directory path
+    /// * `table_name` - Name of the table
+    /// * `column_name` - Name of the column to index
+    /// * `table_data` - Iterator of (RecordId, column_value) tuples from table scan
+    ///
+    /// # Performance
+    /// - Calculates optimal tree depth before construction
+    /// - Uses bulk loading (O(n)) instead of repeated inserts (O(n log n))
+    /// - Automatically sorts data if needed
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Scan table and extract column values
+    /// let table_data: Vec<(RecordId, i64)> = /* scan table */;
+    ///
+    /// // Create index with automatic sorting and optimal tree construction
+    /// index_manager.create_index_from_table(
+    ///     "/path/to/db",
+    ///     "users",
+    ///     "age",
+    ///     table_data.into_iter()
+    /// )?;
+    /// ```
+    pub fn create_index_from_table<I>(
+        &mut self,
+        db_path: &str,
+        table_name: &str,
+        column_name: &str,
+        table_data: I,
+    ) -> IndexResult<()>
+    where
+        I: Iterator<Item = (RecordId, i64)>,
+    {
+        // Collect and sort the data
+        let mut entries: Vec<(i64, RecordId)> =
+            table_data.map(|(rid, value)| (value, rid)).collect();
+
+        let entry_count = entries.len();
+
+        // Calculate optimal tree depth for informational purposes
+        let optimal_depth =
+            crate::btree::BPlusTree::calculate_optimal_depth(entry_count, DEFAULT_ORDER);
+
+        // Sort entries by key (required for bulk load)
+        entries.sort_by_key(|e| e.0);
+
+        // Create the index file
+        let mut buffer_manager = self.buffer_manager.lock().unwrap();
+        let mut index_file = IndexFile::create(
+            &mut *buffer_manager,
+            db_path,
+            table_name,
+            column_name,
+            DEFAULT_ORDER,
+        )?;
+
+        // Use bulk load for efficient tree construction
+        index_file.bulk_load(entries.into_iter())?;
+
+        // Flush to disk
+        index_file.flush(&mut *buffer_manager)?;
+
+        drop(buffer_manager);
+
+        // Store in open indexes
+        self.open_indexes.insert(
+            (table_name.to_string(), column_name.to_string()),
+            index_file,
+        );
+
+        // Log success with tree statistics
+        eprintln!(
+            "✓ Created index on {}.{} with {} entries (optimal depth: {})",
+            table_name, column_name, entry_count, optimal_depth
+        );
+
+        Ok(())
+    }
+
     /// Drop an index
     pub fn drop_index(
         &mut self,

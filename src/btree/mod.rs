@@ -120,6 +120,39 @@ impl BPlusTree {
         }
     }
 
+    /// Calculate the ideal tree depth based on number of entries and tree order
+    ///
+    /// # Arguments
+    /// * `entry_count` - Number of entries that will be stored
+    /// * `order` - Tree order (max children per internal node)
+    ///
+    /// # Returns
+    /// Optimal tree depth (1 for all entries in one leaf, 2+ for multi-level trees)
+    pub fn calculate_optimal_depth(entry_count: usize, order: usize) -> usize {
+        if entry_count == 0 {
+            return 0;
+        }
+
+        let max_leaf_entries = order - 1;
+        if entry_count <= max_leaf_entries {
+            return 1; // All entries fit in a single leaf
+        }
+
+        // Calculate minimum number of leaf nodes needed
+        let leaf_count = entry_count.div_ceil(max_leaf_entries);
+
+        // Calculate depth: each internal level can have up to 'order' children
+        let mut depth = 1; // Start with leaf level
+        let mut nodes_at_level = leaf_count;
+
+        while nodes_at_level > 1 {
+            nodes_at_level = nodes_at_level.div_ceil(order);
+            depth += 1;
+        }
+
+        depth
+    }
+
     /// Maximum entries in a leaf node
     fn max_leaf_entries(&self) -> usize {
         self.order - 1
@@ -504,6 +537,134 @@ impl BPlusTree {
                 break;
             }
         }
+
+        Ok(())
+    }
+
+    /// Efficiently build a B+ tree from pre-sorted entries
+    ///
+    /// This method is significantly faster than repeated individual inserts when loading
+    /// a large amount of data. It requires that entries are already sorted by key.
+    ///
+    /// # Arguments
+    /// * `entries` - Iterator of (key, value) pairs in ascending key order
+    ///
+    /// # Performance
+    /// Time complexity: O(n) where n is the number of entries
+    /// Space complexity: O(d * m) where d is tree depth and m is order
+    ///
+    /// # Panics
+    /// If entries are not sorted in ascending order
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut tree = BPlusTree::new(500)?;
+    /// let mut entries: Vec<(i64, RecordId)> = /* collect data */;
+    /// entries.sort_by_key(|e| e.0); // MUST sort first
+    /// tree.bulk_load(entries.into_iter())?;
+    /// ```
+    pub fn bulk_load<I>(&mut self, entries: I) -> BPlusTreeResult<()>
+    where
+        I: Iterator<Item = (BPlusKey, RecordId)>,
+    {
+        // Clear existing tree
+        self.root = None;
+        self.nodes.clear();
+        self.free_list.clear();
+        self.first_leaf = None;
+        self.entry_count = 0;
+
+        let max_leaf_entries = self.max_leaf_entries();
+        let max_internal_children = self.max_internal_children();
+
+        // Collect entries into leaf nodes
+        let mut leaves: Vec<NodeId> = Vec::new();
+        let mut current_leaf = LeafNode::new();
+        let mut prev_key = None;
+
+        for (key, value) in entries {
+            // Verify sorted order
+            if let Some(prev) = prev_key {
+                if key < prev {
+                    return Err(BPlusTreeError::InvalidState(
+                        "Bulk load requires sorted entries".to_string(),
+                    ));
+                }
+            }
+            prev_key = Some(key);
+
+            // Add to current leaf
+            current_leaf.keys.push(key);
+            current_leaf.values.push(value);
+            self.entry_count += 1;
+
+            // If leaf is full, allocate it and start a new one
+            if current_leaf.len() >= max_leaf_entries {
+                let leaf_id = self.allocate_node(BPlusNode::Leaf(current_leaf));
+                leaves.push(leaf_id);
+                current_leaf = LeafNode::new();
+            }
+        }
+
+        // Handle the last partially-filled leaf
+        if !current_leaf.is_empty() {
+            let leaf_id = self.allocate_node(BPlusNode::Leaf(current_leaf));
+            leaves.push(leaf_id);
+        }
+
+        // Handle empty tree
+        if leaves.is_empty() {
+            return Ok(());
+        }
+
+        // Link leaves together
+        for i in 0..leaves.len() - 1 {
+            let leaf = self
+                .get_node_mut(leaves[i])
+                .and_then(|n| n.as_leaf_mut())
+                .ok_or(BPlusTreeError::NodeNotFound(leaves[i]))?;
+            leaf.next = Some(leaves[i + 1]);
+        }
+
+        // Track first leaf
+        self.first_leaf = Some(leaves[0]);
+
+        // Build internal levels bottom-up
+        let mut current_level = leaves;
+
+        while current_level.len() > 1 {
+            let mut next_level: Vec<NodeId> = Vec::new();
+            let mut i = 0;
+
+            while i < current_level.len() {
+                let mut keys = Vec::new();
+                let mut children = Vec::new();
+
+                // Collect up to max_internal_children nodes
+                let end = (i + max_internal_children).min(current_level.len());
+                for &child_id in &current_level[i..end] {
+                    let child_max_key = self
+                        .get_node(child_id)
+                        .and_then(|n| n.max_key())
+                        .ok_or(BPlusTreeError::NodeNotFound(child_id))?;
+
+                    keys.push(child_max_key);
+                    children.push(child_id);
+                }
+
+                // Create internal node
+                let internal = InternalNode::new(keys, children);
+                let internal_id = self.allocate_node(BPlusNode::Internal(internal));
+                next_level.push(internal_id);
+
+                i = end;
+            }
+
+            current_level = next_level;
+        }
+
+        // Set root
+        self.root = Some(current_level[0]);
 
         Ok(())
     }
@@ -1489,5 +1650,230 @@ mod tests {
         // First entry from iterator should be minimum
         let first = tree.iter().next().unwrap();
         assert_eq!(first.0, 10);
+    }
+
+    #[test]
+    fn test_calculate_optimal_depth() {
+        // Empty tree
+        assert_eq!(BPlusTree::calculate_optimal_depth(0, 500), 0);
+
+        // Single leaf (order=500, max_leaf_entries=499)
+        assert_eq!(BPlusTree::calculate_optimal_depth(1, 500), 1);
+        assert_eq!(BPlusTree::calculate_optimal_depth(100, 500), 1);
+        assert_eq!(BPlusTree::calculate_optimal_depth(499, 500), 1);
+
+        // Two levels (1 leaf + 1 internal)
+        assert_eq!(BPlusTree::calculate_optimal_depth(500, 500), 2);
+        assert_eq!(BPlusTree::calculate_optimal_depth(1000, 500), 2);
+
+        // Three levels
+        // 500 leaves * 499 entries = 249,500 entries max with 2 levels
+        // So 249,501 entries needs 3 levels
+        assert_eq!(BPlusTree::calculate_optimal_depth(250_000, 500), 3);
+
+        // Smaller tree for easier verification
+        // Order 4: max_leaf_entries = 3
+        // 1 leaf: up to 3 entries (depth 1)
+        // 2-4 leaves: up to 12 entries (depth 2)
+        // 5-16 leaves: up to 48 entries (depth 3)
+        assert_eq!(BPlusTree::calculate_optimal_depth(3, 4), 1);
+        assert_eq!(BPlusTree::calculate_optimal_depth(4, 4), 2);
+        assert_eq!(BPlusTree::calculate_optimal_depth(12, 4), 2);
+        assert_eq!(BPlusTree::calculate_optimal_depth(13, 4), 3);
+    }
+
+    #[test]
+    fn test_bulk_load_empty() {
+        let mut tree = BPlusTree::new(4).unwrap();
+        let entries: Vec<(i64, RecordId)> = vec![];
+
+        tree.bulk_load(entries.into_iter()).unwrap();
+
+        assert!(tree.is_empty());
+        assert_eq!(tree.len(), 0);
+        assert_eq!(tree.height(), 0);
+    }
+
+    #[test]
+    fn test_bulk_load_single() {
+        let mut tree = BPlusTree::new(4).unwrap();
+        let entries = vec![(10, rid(1, 0))];
+
+        tree.bulk_load(entries.into_iter()).unwrap();
+
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree.height(), 1);
+        assert_eq!(tree.search(10), Some(rid(1, 0)));
+    }
+
+    #[test]
+    fn test_bulk_load_small() {
+        let mut tree = BPlusTree::new(4).unwrap();
+        let mut entries: Vec<(i64, RecordId)> =
+            (0..10).map(|i| (i * 10, rid(1, i as usize))).collect();
+
+        tree.bulk_load(entries.into_iter()).unwrap();
+
+        assert_eq!(tree.len(), 10);
+
+        // Verify all entries are searchable
+        for i in 0..10 {
+            assert_eq!(tree.search(i * 10), Some(rid(1, i as usize)));
+        }
+
+        // Verify iterator returns sorted order
+        let iter_entries: Vec<_> = tree.iter().collect();
+        for i in 0..10 {
+            assert_eq!(iter_entries[i], ((i * 10) as i64, rid(1, i as usize)));
+        }
+    }
+
+    #[test]
+    fn test_bulk_load_large() {
+        let mut tree = BPlusTree::new(500).unwrap();
+        let entries: Vec<(i64, RecordId)> = (0..10000)
+            .map(|i| (i, rid(i as usize / 100, i as usize % 100)))
+            .collect();
+
+        tree.bulk_load(entries.into_iter()).unwrap();
+
+        assert_eq!(tree.len(), 10000);
+
+        // Verify tree structure is correct
+        let depth = tree.height();
+        let expected_depth = BPlusTree::calculate_optimal_depth(10000, 500);
+        assert_eq!(depth, expected_depth);
+
+        // Spot check some entries
+        assert_eq!(tree.search(0), Some(rid(0, 0)));
+        assert_eq!(tree.search(5000), Some(rid(50, 0)));
+        assert_eq!(tree.search(9999), Some(rid(99, 99)));
+
+        // Verify all entries via iterator
+        let iter_entries: Vec<_> = tree.iter().collect();
+        assert_eq!(iter_entries.len(), 10000);
+        for i in 0..10000 {
+            assert_eq!(iter_entries[i].0, i as i64);
+        }
+    }
+
+    #[test]
+    fn test_bulk_load_with_duplicates() {
+        let mut tree = BPlusTree::new(4).unwrap();
+        let entries = vec![
+            (10, rid(1, 0)),
+            (10, rid(1, 1)),
+            (20, rid(2, 0)),
+            (20, rid(2, 1)),
+            (20, rid(2, 2)),
+            (30, rid(3, 0)),
+        ];
+
+        tree.bulk_load(entries.into_iter()).unwrap();
+
+        assert_eq!(tree.len(), 6);
+
+        let results_10 = tree.search_all(10);
+        assert_eq!(results_10.len(), 2);
+        assert!(results_10.contains(&rid(1, 0)));
+        assert!(results_10.contains(&rid(1, 1)));
+
+        let results_20 = tree.search_all(20);
+        assert_eq!(results_20.len(), 3);
+    }
+
+    #[test]
+    fn test_bulk_load_unsorted_fails() {
+        let mut tree = BPlusTree::new(4).unwrap();
+        let entries = vec![
+            (30, rid(1, 0)),
+            (10, rid(1, 1)), // Out of order!
+            (20, rid(1, 2)),
+        ];
+
+        let result = tree.bulk_load(entries.into_iter());
+        assert!(result.is_err());
+
+        // Tree should be empty after failed bulk load
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn test_bulk_load_vs_individual_inserts() {
+        // Create two trees: one with bulk load, one with individual inserts
+        let mut tree_bulk = BPlusTree::new(500).unwrap();
+        let mut tree_individual = BPlusTree::new(500).unwrap();
+
+        let entries: Vec<(i64, RecordId)> = (0..1000)
+            .map(|i| (i, rid(i as usize / 100, i as usize % 100)))
+            .collect();
+
+        // Bulk load
+        tree_bulk.bulk_load(entries.iter().copied()).unwrap();
+
+        // Individual inserts
+        for &(key, rid) in &entries {
+            tree_individual.insert(key, rid).unwrap();
+        }
+
+        // Both should have same entries
+        assert_eq!(tree_bulk.len(), tree_individual.len());
+        assert_eq!(tree_bulk.len(), 1000);
+
+        // Verify all entries are identical
+        for i in 0..1000 {
+            assert_eq!(tree_bulk.search(i), tree_individual.search(i));
+        }
+
+        // Iterators should produce same results
+        let bulk_entries: Vec<_> = tree_bulk.iter().collect();
+        let individual_entries: Vec<_> = tree_individual.iter().collect();
+        assert_eq!(bulk_entries, individual_entries);
+    }
+
+    #[test]
+    fn test_bulk_load_replaces_existing_tree() {
+        let mut tree = BPlusTree::new(4).unwrap();
+
+        // Insert some entries
+        for i in 0..5 {
+            tree.insert(i * 10, rid(1, i as usize)).unwrap();
+        }
+
+        assert_eq!(tree.len(), 5);
+
+        // Bulk load new data (should replace existing)
+        let new_entries: Vec<(i64, RecordId)> = (0..10).map(|i| (i, rid(2, i as usize))).collect();
+
+        tree.bulk_load(new_entries.into_iter()).unwrap();
+
+        // Old entries should be gone
+        assert_eq!(tree.len(), 10);
+        assert_eq!(tree.search(0), Some(rid(2, 0)));
+        assert_eq!(tree.search(40), None);
+    }
+
+    #[test]
+    fn test_bulk_load_negative_keys() {
+        let mut tree = BPlusTree::new(4).unwrap();
+        let entries = vec![
+            (-50, rid(1, 0)),
+            (-30, rid(1, 1)),
+            (-10, rid(1, 2)),
+            (0, rid(1, 3)),
+            (10, rid(1, 4)),
+            (30, rid(1, 5)),
+        ];
+
+        tree.bulk_load(entries.into_iter()).unwrap();
+
+        assert_eq!(tree.len(), 6);
+        assert_eq!(tree.search(-50), Some(rid(1, 0)));
+        assert_eq!(tree.search(0), Some(rid(1, 3)));
+        assert_eq!(tree.search(30), Some(rid(1, 5)));
+
+        // Verify sorted order via iterator
+        let first = tree.iter().next().unwrap();
+        assert_eq!(first.0, -50);
     }
 }
