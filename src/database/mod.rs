@@ -690,18 +690,23 @@ impl DatabaseManager {
             let _ = self.index_manager.drop_index(&db_path_str, table, col_name);
         }
 
-        // Step 3: Clear all data from the table
-        // Scan and collect all record IDs, then delete them
-        let record_ids: Vec<_> = self
-            .record_manager
-            .scan(table)?
-            .into_iter()
-            .map(|(rid, _)| rid)
-            .collect();
-
-        for rid in record_ids {
-            self.record_manager.delete(table, rid)?;
+        // Step 3: Clear all data from the table efficiently
+        // Instead of deleting records, close and recreate the table file
+        // This is much faster and uses minimal memory
+        let schema = self.metadata_to_schema(&table_meta);
+        let table_path = self.table_path(db_name, table);
+        let table_path_str = table_path.to_string_lossy().to_string();
+        
+        // Close the table
+        self.record_manager.close_table(table)?;
+        
+        // Delete the old table file
+        if table_path.exists() {
+            std::fs::remove_file(&table_path)?;
         }
+        
+        // Recreate empty table file
+        self.record_manager.create_table(&table_path_str, schema.clone())?;
 
         // Step 4: Load data without index maintenance
         // Use csv crate for efficient parsing
@@ -780,8 +785,9 @@ impl DatabaseManager {
                 })?;
 
             // Scan table and extract values for this column
+            // Process in streaming fashion - convert iterator directly without collecting
             let records = self.record_manager.scan(table)?;
-            let table_data: Vec<_> = records
+            let table_data = records
                 .into_iter()
                 .filter_map(|(rid, record)| {
                     if let crate::record::Value::Int(val) = record.get(col_idx).unwrap() {
@@ -789,15 +795,14 @@ impl DatabaseManager {
                     } else {
                         None
                     }
-                })
-                .collect();
+                });
 
-            // Use bulk create index function
+            // Use bulk create index function - it will consume the iterator
             self.index_manager.create_index_from_table(
                 &db_path_str,
                 table,
                 col_name,
-                table_data.into_iter(),
+                table_data,
             )?;
         }
 

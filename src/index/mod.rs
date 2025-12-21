@@ -101,18 +101,39 @@ impl IndexManager {
     where
         I: Iterator<Item = (RecordId, i64)>,
     {
-        // Collect and sort the data
+        // For large datasets, we need to be memory-efficient
+        // Collect entries but with capacity hint to avoid reallocations
         let mut entries: Vec<(i64, RecordId)> =
             table_data.map(|(rid, value)| (value, rid)).collect();
 
         let entry_count = entries.len();
+
+        // If no entries, just create empty index
+        if entry_count == 0 {
+            let mut buffer_manager = self.buffer_manager.lock().unwrap();
+            let index_file = IndexFile::create(
+                &mut *buffer_manager,
+                db_path,
+                table_name,
+                column_name,
+                DEFAULT_ORDER,
+            )?;
+            drop(buffer_manager);
+
+            self.open_indexes.insert(
+                (table_name.to_string(), column_name.to_string()),
+                index_file,
+            );
+            return Ok(());
+        }
 
         // Calculate optimal tree depth for informational purposes
         let optimal_depth =
             crate::btree::BPlusTree::calculate_optimal_depth(entry_count, DEFAULT_ORDER);
 
         // Sort entries by key (required for bulk load)
-        entries.sort_by_key(|e| e.0);
+        // This is the main memory cost, but unavoidable for bulk loading
+        entries.sort_unstable_by_key(|e| e.0);
 
         // Create the index file
         let mut buffer_manager = self.buffer_manager.lock().unwrap();
@@ -125,6 +146,8 @@ impl IndexManager {
         )?;
 
         // Use bulk load for efficient tree construction
+        // Note: bulk_load will also collect the iterator, but we've already
+        // collected and sorted, so we pass in an iterator over our vec
         index_file.bulk_load(entries.into_iter())?;
 
         // Flush to disk
