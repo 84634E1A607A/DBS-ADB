@@ -696,17 +696,18 @@ impl DatabaseManager {
         let schema = self.metadata_to_schema(&table_meta);
         let table_path = self.table_path(db_name, table);
         let table_path_str = table_path.to_string_lossy().to_string();
-        
+
         // Close the table
         self.record_manager.close_table(table)?;
-        
+
         // Delete the old table file
         if table_path.exists() {
             std::fs::remove_file(&table_path)?;
         }
-        
+
         // Recreate empty table file
-        self.record_manager.create_table(&table_path_str, schema.clone())?;
+        self.record_manager
+            .create_table(&table_path_str, schema.clone())?;
 
         // Step 4: Load data without index maintenance
         // Use csv crate for efficient parsing
@@ -787,15 +788,13 @@ impl DatabaseManager {
             // Scan table and extract values for this column
             // Process in streaming fashion - convert iterator directly without collecting
             let records = self.record_manager.scan(table)?;
-            let table_data = records
-                .into_iter()
-                .filter_map(|(rid, record)| {
-                    if let crate::record::Value::Int(val) = record.get(col_idx).unwrap() {
-                        Some((rid, *val as i64))
-                    } else {
-                        None
-                    }
-                });
+            let table_data = records.into_iter().filter_map(|(rid, record)| {
+                if let crate::record::Value::Int(val) = record.get(col_idx).unwrap() {
+                    Some((rid, *val as i64))
+                } else {
+                    None
+                }
+            });
 
             // Use bulk create index function - it will consume the iterator
             self.index_manager.create_index_from_table(
@@ -804,6 +803,20 @@ impl DatabaseManager {
                 col_name,
                 table_data,
             )?;
+        }
+
+        // Step 6: Close all indexes to release memory
+        // The indexes are now persisted to disk and will be reopened when needed
+        for col_name in &index_columns {
+            self.index_manager.close_index(table, col_name)?;
+        }
+
+        // Step 7: Flush buffer manager to release page cache
+        // This ensures we're not holding onto all the index pages in memory
+        {
+            let mut buffer_manager = self.buffer_manager.lock().unwrap();
+            // Ignore flush errors - they're not critical for correctness
+            let _ = buffer_manager.flush_all();
         }
 
         Ok(total_inserted)

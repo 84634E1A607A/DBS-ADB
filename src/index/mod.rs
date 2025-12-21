@@ -216,11 +216,15 @@ impl IndexManager {
         Ok(())
     }
 
-    /// Close an index
+    /// Close an index and flush to disk
     pub fn close_index(&mut self, table_name: &str, column_name: &str) -> IndexResult<()> {
         let key = (table_name.to_string(), column_name.to_string());
 
-        if let Some(index_file) = self.open_indexes.remove(&key) {
+        if let Some(mut index_file) = self.open_indexes.remove(&key) {
+            // Flush before closing to ensure all changes are persisted
+            let mut buffer_manager = self.buffer_manager.lock().unwrap();
+            index_file.flush(&mut *buffer_manager)?;
+            drop(buffer_manager);
             let mut buffer_manager = self.buffer_manager.lock().unwrap();
             index_file.close(&mut *buffer_manager)?;
         }
@@ -243,7 +247,8 @@ impl IndexManager {
     pub fn flush_index(&mut self, table_name: &str, column_name: &str) -> IndexResult<()> {
         let key = (table_name.to_string(), column_name.to_string());
 
-        if let Some(index_file) = self.open_indexes.get_mut(&key) {
+        if let Some(mut index_file) = self.open_indexes.remove(&key) {
+            // Flush before closing to ensure all changes are persisted
             let mut buffer_manager = self.buffer_manager.lock().unwrap();
             index_file.flush(&mut *buffer_manager)?;
         }
