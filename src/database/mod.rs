@@ -697,15 +697,20 @@ impl DatabaseManager {
         let table_path = self.table_path(db_name, table);
         let table_path_str = table_path.to_string_lossy().to_string();
 
-        // Close the table
+        // Step 3a: Flush all buffers first - this ensures all OTHER tables' data is safe
+        self.buffer_manager.lock().unwrap().flush_all()?;
+
+        // Step 3b: Close the table (remove from open_tables)
         self.record_manager.close_table(table)?;
 
-        // Delete the old table file
+        // Step 3c: Delete the old table file using the file manager
+        // This ensures the file handle is properly closed before deletion
         if table_path.exists() {
-            std::fs::remove_file(&table_path)?;
+            let mut buffer_manager = self.buffer_manager.lock().unwrap();
+            let _ = buffer_manager.file_manager_mut().remove_file(&table_path);
         }
 
-        // Recreate empty table file
+        // Step 3d: Recreate empty table file
         self.record_manager
             .create_table(&table_path_str, schema.clone())?;
 
