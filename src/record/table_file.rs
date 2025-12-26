@@ -3,6 +3,7 @@ use super::page::Page;
 use super::record::{Record, RecordId};
 use super::schema::TableSchema;
 use crate::file::{BufferManager, FileHandle, PageId};
+use std::sync::{Arc, Mutex};
 
 /// Manages a table's file with multiple pages
 pub struct TableFile {
@@ -228,6 +229,12 @@ impl TableFile {
         Ok(results)
     }
 
+    /// Create a streaming iterator over all records in the table.
+    /// This avoids loading the entire table into memory at once.
+    pub fn scan_iter(self, buffer_manager: Arc<Mutex<BufferManager>>) -> TableScanIter {
+        TableScanIter::new(self, buffer_manager)
+    }
+
     /// Allocate a new page and link it from the previous page
     fn allocate_new_page(
         &mut self,
@@ -247,6 +254,80 @@ impl TableFile {
         prev_page.set_next_page(new_page_id);
 
         Ok(new_page_id)
+    }
+}
+
+/// Streaming table scan iterator (yields records one-by-one).
+pub struct TableScanIter {
+    table: TableFile,
+    buffer_manager: Arc<Mutex<BufferManager>>,
+    page_id: PageId,
+    slot_id: usize,
+    done: bool,
+}
+
+impl TableScanIter {
+    fn new(table: TableFile, buffer_manager: Arc<Mutex<BufferManager>>) -> Self {
+        Self {
+            page_id: table.first_page_id,
+            table,
+            buffer_manager,
+            slot_id: 0,
+            done: false,
+        }
+    }
+}
+
+impl Iterator for TableScanIter {
+    type Item = RecordResult<(RecordId, Record)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+
+        loop {
+            if self.page_id >= self.table.page_count {
+                self.done = true;
+                return None;
+            }
+
+            let mut buffer_manager = self.buffer_manager.lock().unwrap();
+            let page_buffer = match buffer_manager.get_page_mut(self.table.file_handle, self.page_id)
+            {
+                Ok(buf) => buf,
+                Err(err) => return Some(Err(err.into())),
+            };
+
+            let page = match Page::from_buffer(page_buffer) {
+                Ok(page) => page,
+                Err(err) => return Some(Err(err)),
+            };
+
+            for slot_id in self.slot_id..page.slot_count() {
+                if page.is_slot_used(slot_id) {
+                    let record_bytes = match page.get_record(slot_id) {
+                        Ok(bytes) => bytes,
+                        Err(err) => return Some(Err(err)),
+                    };
+                    let record = match Record::deserialize(record_bytes, &self.table.schema) {
+                        Ok(record) => record,
+                        Err(err) => return Some(Err(err)),
+                    };
+
+                    self.slot_id = slot_id + 1;
+                    return Some(Ok((RecordId::new(self.page_id, slot_id), record)));
+                }
+            }
+
+            let next_page = page.next_page();
+            self.slot_id = 0;
+            if next_page == 0 {
+                self.done = true;
+                return None;
+            }
+            self.page_id = next_page;
+        }
     }
 }
 

@@ -41,4 +41,7 @@ pub enum IndexError {
 
     #[error("Index not open: {0}")]
     IndexNotOpen(String),
+
+    #[error("IO error: {0}")]
+    IoError(String),
 }

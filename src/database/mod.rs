@@ -14,7 +14,10 @@ use crate::lexer_parser::{
     AlterStatement, CreateTableField, DBStatement, Operator, SelectClause, Selectors,
     TableStatement, Value as ParserValue, WhereClause,
 };
-use crate::record::{ColumnDef, Record, RecordManager, TableSchema, Value as RecordValue};
+use crate::record::{
+    ColumnDef, Record, RecordId, RecordManager, TableFile, TableScanIter, TableSchema,
+    Value as RecordValue,
+};
 
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -73,6 +76,39 @@ pub struct DatabaseManager {
     buffer_manager: Arc<Mutex<BufferManager>>,
     record_manager: RecordManager,
     index_manager: IndexManager,
+}
+
+struct TableIntColumnIter {
+    scan_iter: TableScanIter,
+    col_idx: usize,
+}
+
+impl TableIntColumnIter {
+    fn new(scan_iter: TableScanIter, col_idx: usize) -> Self {
+        Self { scan_iter, col_idx }
+    }
+}
+
+impl Iterator for TableIntColumnIter {
+    type Item = crate::index::IndexResult<(RecordId, i64)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let item = self.scan_iter.next()?;
+            match item {
+                Ok((rid, record)) => {
+                    if let Some(RecordValue::Int(val)) = record.get(self.col_idx) {
+                        return Some(Ok((rid, *val as i64)));
+                    }
+                }
+                Err(err) => {
+                    return Some(Err(crate::index::IndexError::SerializationError(
+                        err.to_string(),
+                    )));
+                }
+            }
+        }
+    }
 }
 
 impl DatabaseManager {
@@ -818,16 +854,14 @@ impl DatabaseManager {
                     DatabaseError::ColumnNotFound(col_name.clone(), table.to_string())
                 })?;
 
-            // Scan table and extract values for this column
-            // Process in streaming fashion - convert iterator directly without collecting
-            let records = self.record_manager.scan(table)?;
-            let table_data = records.into_iter().filter_map(|(rid, record)| {
-                if let crate::record::Value::Int(val) = record.get(col_idx).unwrap() {
-                    Some((rid, *val as i64))
-                } else {
-                    None
-                }
-            });
+            // Scan table and extract values for this column using a streaming iterator
+            // to avoid loading all records into memory at once.
+            let table_file = {
+                let mut buffer_manager = self.buffer_manager.lock().unwrap();
+                TableFile::open(&mut buffer_manager, &table_path_str, schema.clone())?
+            };
+            let scan_iter = table_file.scan_iter(self.buffer_manager.clone());
+            let table_data = TableIntColumnIter::new(scan_iter, col_idx);
 
             // Use bulk create index function - it will consume the iterator
             self.index_manager.create_index_from_table(
@@ -837,18 +871,15 @@ impl DatabaseManager {
                 table_data,
             )?;
 
+            // Flush and close the index immediately to free memory before building the next one.
+            self.index_manager.close_index(table, col_name)?;
+
             // Flush and clear buffer pool after each index creation
-            // This releases ALL cached pages to prevent memory buildup
+            // This releases ALL cached pages to prevent memory buildup.
             self.buffer_manager.lock().unwrap().flush_and_clear()?;
         }
 
-        // Step 6: Close all indexes to release memory
-        // The indexes are now persisted to disk and will be reopened when needed
-        for col_name in &index_columns {
-            self.index_manager.close_index(table, col_name)?;
-        }
-
-        // Step 7: Flush buffer manager to release page cache
+        // Step 6: Flush buffer manager to release page cache
         // This ensures we're not holding onto all the index pages in memory
         {
             let mut buffer_manager = self.buffer_manager.lock().unwrap();

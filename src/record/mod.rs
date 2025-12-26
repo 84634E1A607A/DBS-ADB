@@ -9,7 +9,7 @@ pub use error::{RecordError, RecordResult};
 pub use page::{Page, PageHeader};
 pub use record::{Record, RecordId, SlotId};
 pub use schema::{ColumnDef, TableSchema};
-pub use table_file::TableFile;
+pub use table_file::{TableFile, TableScanIter};
 pub use value::{DataType, Value};
 
 use crate::file::BufferManager;

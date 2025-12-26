@@ -98,7 +98,7 @@ impl IndexManager {
     /// * `db_path` - Path to the database directory
     /// * `table_name` - Name of the table
     /// * `column_name` - Name of the column to index
-    /// * `table_data` - Iterator over (RecordId, value) pairs
+    /// * `table_data` - Iterator over (RecordId, value) pairs (as IndexResult)
     ///
     /// # Example
     /// ```ignore
@@ -117,17 +117,17 @@ impl IndexManager {
         table_data: I,
     ) -> IndexResult<()>
     where
-        I: Iterator<Item = (RecordId, i64)>,
+        I: Iterator<Item = IndexResult<(RecordId, i64)>>,
     {
         use std::fs::File;
-        use std::io::{BufRead, BufReader, BufWriter, Write};
+        use std::io::{BufWriter, Write};
         use std::path::PathBuf;
 
-        // Memory limit for external sort: ~150MB for sorting chunks
-        // Each entry is (i64, RecordId) = 8 + 8 = 16 bytes
-        const MEMORY_LIMIT_BYTES: usize = 150 * 1024 * 1024;
-        const ENTRY_SIZE: usize = 16;
-        const CHUNK_SIZE: usize = MEMORY_LIMIT_BYTES / ENTRY_SIZE; // ~9.8M entries per chunk
+        // Memory limit for external sort: keep well under the 256MB cap.
+        // Use actual in-memory entry size to avoid underestimating usage.
+        const MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+        const ENTRY_SIZE: usize = std::mem::size_of::<(i64, RecordId)>();
+        let chunk_size = (MEMORY_LIMIT_BYTES / ENTRY_SIZE).max(1);
 
         // Temporary directory for sorted chunks
         let temp_dir = PathBuf::from(db_path).join(".tmp_index_sort");
@@ -135,7 +135,7 @@ impl IndexManager {
 
         // Phase 1: Split into sorted chunks
         let mut chunk_files = Vec::new();
-        let mut current_chunk = Vec::with_capacity(CHUNK_SIZE);
+        let mut current_chunk = Vec::with_capacity(chunk_size.min(100_000));
         let mut total_entries = 0;
 
         eprintln!(
@@ -143,11 +143,12 @@ impl IndexManager {
             table_name, column_name
         );
 
-        for (rid, value) in table_data {
+        for item in table_data {
+            let (rid, value) = item?;
             current_chunk.push((value, rid));
             total_entries += 1;
 
-            if current_chunk.len() >= CHUNK_SIZE {
+            if current_chunk.len() >= chunk_size {
                 // Sort this chunk
                 current_chunk.sort_unstable_by_key(|e| e.0);
 
@@ -158,7 +159,7 @@ impl IndexManager {
                 let mut writer = BufWriter::new(file);
 
                 for (key, rid) in &current_chunk {
-                    // Write as binary: 8 bytes for key, 8 bytes for rid
+                    // Write as binary: 8 bytes for key, 16 bytes for RecordId
                     writer
                         .write_all(&key.to_le_bytes())
                         .map_err(|e| IndexError::IoError(e.to_string()))?;
