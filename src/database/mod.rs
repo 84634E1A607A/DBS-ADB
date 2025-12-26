@@ -787,18 +787,18 @@ impl DatabaseManager {
                 }
 
                 let col = &table_meta.columns[idx];
-                let field = field.trim();
+                let trimmed = field.trim();
 
                 // Parse according to the column's data type - much faster than guessing!
-                let value = if field.eq_ignore_ascii_case("null") {
+                let value = if trimmed.eq_ignore_ascii_case("null") {
                     ParserValue::Null
                 } else {
                     match col.to_data_type() {
-                        crate::record::DataType::Int => match field.parse::<i64>() {
+                        crate::record::DataType::Int => match trimmed.parse::<i64>() {
                             Ok(i) => ParserValue::Integer(i),
                             Err(_) => ParserValue::Null,
                         },
-                        crate::record::DataType::Float => match field.parse::<f64>() {
+                        crate::record::DataType::Float => match trimmed.parse::<f64>() {
                             Ok(f) => ParserValue::Float(f),
                             Err(_) => ParserValue::Null,
                         },

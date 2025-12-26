@@ -618,7 +618,7 @@ fn test_load_data_infile() {
     db_manager.create_table("test", fields).unwrap();
 
     // Create test CSV file
-    let csv_content = "1,hello,1.5\n2,world,2.5\n3,rust,3.5\n";
+    let csv_content = "1,hello,1.5\n2, world,2.5\n3,rust,3.5\n";
     let csv_file = _temp.path().join("test.csv");
     std::fs::write(&csv_file, csv_content).unwrap();
 
@@ -641,6 +641,7 @@ fn test_load_data_infile() {
 
     let (_, rows) = db_manager.select(clause).unwrap();
     assert_eq!(rows.len(), 3);
+    assert_eq!(rows[1][1], " world");
 }
 
 #[test]
