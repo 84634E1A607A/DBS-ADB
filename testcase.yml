@@ -10,3 +10,4 @@ run:
     - index
     - comb
     - join
+    - fk
