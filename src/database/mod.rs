@@ -125,6 +125,7 @@ struct ForeignKeyCheck {
     ref_schema: TableSchema,
 }
 
+#[derive(Clone)]
 struct ReferencingForeignKeyCheck {
     child_table: String,
     child_column_names: Vec<String>,
@@ -685,6 +686,13 @@ impl DatabaseManager {
                     .iter()
                     .any(|idx| update_indices.contains(idx))
             });
+        let referencing_checks = self.build_referencing_fk_checks(&table_meta)?;
+        let should_check_referencing = !referencing_checks.is_empty()
+            && referencing_checks.iter().any(|fk| {
+                fk.parent_column_indices
+                    .iter()
+                    .any(|idx| update_indices.contains(idx))
+            });
 
         let indexed_columns = if update_indices.is_empty() {
             Vec::new()
@@ -707,6 +715,44 @@ impl DatabaseManager {
                     let data_type = &schema.columns[*col_idx].data_type;
                     let record_value = self.parser_value_to_record_value(new_value, data_type);
                     record.set(*col_idx, record_value);
+                }
+
+                if should_check_referencing {
+                    let mut changed_fks = Vec::new();
+                    for fk in &referencing_checks {
+                        if !fk
+                            .parent_column_indices
+                            .iter()
+                            .any(|idx| update_indices.contains(idx))
+                        {
+                            continue;
+                        }
+                        let mut changed = false;
+                        for idx in &fk.parent_column_indices {
+                            let old_value = original.get(*idx).unwrap();
+                            let new_value = record.get(*idx).unwrap();
+                            if old_value != new_value {
+                                changed = true;
+                                break;
+                            }
+                        }
+                        if changed {
+                            changed_fks.push(fk.clone());
+                        }
+                    }
+
+                    if !changed_fks.is_empty() {
+                        let db_name = self
+                            .current_db
+                            .clone()
+                            .ok_or(DatabaseError::NoDatabaseSelected)?;
+                        self.validate_foreign_keys_on_delete_record(
+                            &db_name,
+                            &db_path_str,
+                            &changed_fks,
+                            &original,
+                        )?;
+                    }
                 }
 
                 if should_check_fk {
