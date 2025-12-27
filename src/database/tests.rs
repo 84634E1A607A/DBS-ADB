@@ -1,5 +1,5 @@
 use super::*;
-use crate::lexer_parser::{ColumnType, CreateTableField, Selectors, WhereClause};
+use crate::lexer_parser::{AlterStatement, ColumnType, CreateTableField, Selectors, WhereClause};
 use tempfile::TempDir;
 
 fn setup_test_db() -> (TempDir, DatabaseManager) {
@@ -214,6 +214,68 @@ fn test_insert_and_select() {
     assert_eq!(rows[0], vec!["1", "hello", "1.50"]);
     assert_eq!(rows[1], vec!["2", "world", "2.50"]);
     assert_eq!(rows[2], vec!["3", "rust", "3.50"]);
+}
+
+#[test]
+fn test_add_and_drop_index() {
+    let (temp_dir, mut db_manager) = setup_test_db();
+
+    db_manager.create_database("testdb").unwrap();
+    db_manager.use_database("testdb").unwrap();
+
+    let fields = vec![
+        CreateTableField::Col("a".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Col(
+            "b".to_string(),
+            ColumnType::Char(12),
+            true,
+            ParserValue::Null,
+        ),
+        CreateTableField::Col("c".to_string(), ColumnType::Float, true, ParserValue::Null),
+    ];
+
+    db_manager.create_table("tbl9", fields).unwrap();
+
+    let rows = vec![
+        vec![
+            ParserValue::Integer(1),
+            ParserValue::String("1".to_string()),
+            ParserValue::Float(1.0),
+        ],
+        vec![
+            ParserValue::Integer(2),
+            ParserValue::String("2".to_string()),
+            ParserValue::Float(2.0),
+        ],
+    ];
+    db_manager.insert("tbl9", rows).unwrap();
+
+    db_manager
+        .execute_alter_statement(AlterStatement::AddIndex(
+            "tbl9".to_string(),
+            Some("idx_a".to_string()),
+            vec!["a".to_string()],
+        ))
+        .unwrap();
+
+    let meta = db_manager.describe_table("tbl9").unwrap();
+    assert_eq!(meta.indexes.len(), 1);
+    assert_eq!(meta.indexes[0].name, "idx_a");
+    assert_eq!(meta.indexes[0].columns, vec!["a".to_string()]);
+
+    let index_path = temp_dir.path().join("testdb").join("tbl9_a.idx");
+    assert!(index_path.exists());
+
+    db_manager
+        .execute_alter_statement(AlterStatement::DropIndex(
+            "tbl9".to_string(),
+            "idx_a".to_string(),
+        ))
+        .unwrap();
+
+    let meta = db_manager.describe_table("tbl9").unwrap();
+    assert!(meta.indexes.is_empty());
+    assert!(!index_path.exists());
 }
 
 #[test]

@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 use crate::catalog::{
-    CatalogError, ColumnMetadata, DatabaseMetadata, ForeignKeyMetadata, TableMetadata,
+    CatalogError, ColumnMetadata, DatabaseMetadata, ForeignKeyMetadata, IndexMetadata,
+    TableMetadata,
 };
 use crate::file::{BufferManager, PagedFileManager};
 use crate::index::IndexManager;
@@ -15,7 +16,7 @@ use crate::lexer_parser::{
     TableStatement, Value as ParserValue, WhereClause,
 };
 use crate::record::{
-    ColumnDef, Record, RecordId, RecordManager, TableFile, TableScanIter, TableSchema,
+    ColumnDef, DataType, Record, RecordId, RecordManager, TableFile, TableScanIter, TableSchema,
     Value as RecordValue,
 };
 
@@ -1112,10 +1113,136 @@ impl DatabaseManager {
 
     pub fn execute_alter_statement(
         &mut self,
-        _stmt: AlterStatement,
+        stmt: AlterStatement,
     ) -> DatabaseResult<QueryResult> {
-        // TODO: Implement alter statements
-        Ok(QueryResult::Empty)
+        match stmt {
+            AlterStatement::AddIndex(table_name, index_name, columns) => {
+                if columns.len() != 1 {
+                    return Err(DatabaseError::TypeMismatch(
+                        "Only single-column indexes are supported".to_string(),
+                    ));
+                }
+
+                let column_name = columns[0].clone();
+                let index_name = index_name.unwrap_or_else(|| format!("idx_{}", column_name));
+
+                let (schema, col_idx) = {
+                    let metadata = self
+                        .current_metadata
+                        .as_ref()
+                        .ok_or(DatabaseError::NoDatabaseSelected)?;
+                    let table_meta = metadata.get_table(&table_name)?.clone();
+
+                    if table_meta
+                        .indexes
+                        .iter()
+                        .any(|idx| idx.name == index_name || idx.columns == columns)
+                    {
+                        return Err(DatabaseError::TypeMismatch(format!(
+                            "Index {} already exists",
+                            index_name
+                        )));
+                    }
+
+                    let col_idx = table_meta
+                        .columns
+                        .iter()
+                        .position(|c| c.name == column_name)
+                        .ok_or_else(|| {
+                            DatabaseError::ColumnNotFound(column_name.clone(), table_name.clone())
+                        })?;
+
+                    if table_meta.columns[col_idx].to_data_type() != DataType::Int {
+                        return Err(DatabaseError::TypeMismatch(
+                            "Only INT columns can be indexed".to_string(),
+                        ));
+                    }
+
+                    let schema = self.metadata_to_schema(&table_meta);
+                    (schema, col_idx)
+                };
+
+                let db_name = self
+                    .current_db
+                    .as_ref()
+                    .ok_or(DatabaseError::NoDatabaseSelected)?;
+                let db_path = self.data_dir.join(db_name);
+                let db_path_str = db_path.to_string_lossy().to_string();
+
+                let table_path = self.table_path(db_name, &table_name);
+                self.record_manager.open_table(
+                    &table_path.to_string_lossy().to_string(),
+                    schema.clone(),
+                )?;
+
+                let scan_iter = self.record_manager.scan_iter(&table_name)?;
+                let table_iter = TableIntColumnIter::new(scan_iter, col_idx);
+                self.index_manager.create_index_from_table(
+                    &db_path_str,
+                    &table_name,
+                    &column_name,
+                    table_iter,
+                )?;
+
+                let metadata = self.current_metadata.as_mut().unwrap();
+                let table_meta_mut = metadata.get_table_mut(&table_name)?;
+                table_meta_mut.indexes.push(IndexMetadata {
+                    name: index_name,
+                    columns,
+                });
+                self.save_current_metadata()?;
+
+                Ok(QueryResult::Empty)
+            }
+            AlterStatement::DropIndex(table_name, index_name) => {
+                let db_name = self
+                    .current_db
+                    .as_ref()
+                    .ok_or(DatabaseError::NoDatabaseSelected)?;
+                let db_path = self.data_dir.join(db_name);
+                let db_path_str = db_path.to_string_lossy().to_string();
+
+                let column_name = {
+                    let metadata = self
+                        .current_metadata
+                        .as_mut()
+                        .ok_or(DatabaseError::NoDatabaseSelected)?;
+                    let table_meta = metadata.get_table_mut(&table_name)?;
+
+                    let pos = table_meta
+                        .indexes
+                        .iter()
+                        .position(|idx| idx.name == index_name)
+                        .ok_or_else(|| {
+                            DatabaseError::TypeMismatch(format!(
+                                "Index {} not found",
+                                index_name
+                            ))
+                        })?;
+
+                    let index_meta = table_meta.indexes.remove(pos);
+                    if index_meta.columns.len() != 1 {
+                        return Err(DatabaseError::TypeMismatch(
+                            "Only single-column indexes are supported".to_string(),
+                        ));
+                    }
+                    index_meta.columns[0].clone()
+                };
+
+                if let Err(err) =
+                    self.index_manager
+                        .drop_index(&db_path_str, &table_name, &column_name)
+                {
+                    if !matches!(err, crate::index::IndexError::IndexNotFound(_)) {
+                        return Err(DatabaseError::IndexError(err));
+                    }
+                }
+
+                self.save_current_metadata()?;
+                Ok(QueryResult::Empty)
+            }
+            _ => Ok(QueryResult::Empty),
+        }
     }
 }
 
