@@ -61,6 +61,9 @@ pub enum DatabaseError {
     #[error("Primary key violation: duplicate key value")]
     PrimaryKeyViolation,
 
+    #[error("primary")]
+    PrimaryKeyError,
+
     #[error("Foreign key violation")]
     ForeignKeyViolation,
 
@@ -1538,6 +1541,88 @@ impl DatabaseManager {
                     }
                 }
 
+                self.save_current_metadata()?;
+                Ok(QueryResult::Empty)
+            }
+            AlterStatement::AddPKey(table_name, columns) => {
+                let (schema, pk_indices) = {
+                    let metadata = self
+                        .current_metadata
+                        .as_ref()
+                        .ok_or(DatabaseError::NoDatabaseSelected)?;
+                    let table_meta = metadata.get_table(&table_name)?.clone();
+
+                    if table_meta.primary_key.is_some() {
+                        return Err(DatabaseError::PrimaryKeyError);
+                    }
+
+                    let mut indices = Vec::with_capacity(columns.len());
+                    for col_name in &columns {
+                        let idx = table_meta
+                            .columns
+                            .iter()
+                            .position(|c| &c.name == col_name)
+                            .ok_or_else(|| {
+                                DatabaseError::ColumnNotFound(
+                                    col_name.clone(),
+                                    table_name.clone(),
+                                )
+                            })?;
+                        indices.push(idx);
+                    }
+
+                    let schema = self.metadata_to_schema(&table_meta);
+                    (schema, indices)
+                };
+
+                let db_name = self
+                    .current_db
+                    .as_ref()
+                    .ok_or(DatabaseError::NoDatabaseSelected)?;
+                let table_path = self.table_path(db_name, &table_name);
+                let _ = self
+                    .record_manager
+                    .open_table(&table_path.to_string_lossy().to_string(), schema);
+
+                let scan_iter = self.record_manager.scan_iter(&table_name)?;
+                let mut pk_set = HashSet::new();
+                for item in scan_iter {
+                    let (_rid, record) = item?;
+                    let mut key_parts = Vec::with_capacity(pk_indices.len());
+                    for &idx in &pk_indices {
+                        let value = record.get(idx).unwrap();
+                        key_parts.push(format!("{:?}", value));
+                    }
+
+                    if !pk_set.insert(key_parts.join("|")) {
+                        return Err(DatabaseError::PrimaryKeyViolation);
+                    }
+                }
+
+                let metadata = self.current_metadata.as_mut().unwrap();
+                let table_meta_mut = metadata.get_table_mut(&table_name)?;
+                table_meta_mut.primary_key = Some(columns.clone());
+                for col in &mut table_meta_mut.columns {
+                    if columns.contains(&col.name) {
+                        col.not_null = true;
+                    }
+                }
+                self.save_current_metadata()?;
+
+                Ok(QueryResult::Empty)
+            }
+            AlterStatement::DropPKey(table_name, _pkey_name) => {
+                let metadata = self
+                    .current_metadata
+                    .as_mut()
+                    .ok_or(DatabaseError::NoDatabaseSelected)?;
+                let table_meta = metadata.get_table_mut(&table_name)?;
+
+                if table_meta.primary_key.is_none() {
+                    return Err(DatabaseError::PrimaryKeyError);
+                }
+
+                table_meta.primary_key = None;
                 self.save_current_metadata()?;
                 Ok(QueryResult::Empty)
             }

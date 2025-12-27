@@ -273,21 +273,23 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
 
         let add_pkey = alter_table
             .clone()
-            // ADD PRIMARY KEY
+            // ADD (CONSTRAINT Identifier)? PRIMARY KEY
             .then(
-                just([
-                    T::Keyword(K::Add),
-                    T::Keyword(K::Primary),
-                    T::Keyword(K::Key),
-                ])
-                // ( field_list )
-                .ignore_then(
-                    identifier()
-                        .separated_by(just(T::Symbol(',')))
-                        .collect()
-                        .delimited_by(just(T::Symbol('(')), just(T::Symbol(')'))),
-                )
-                .boxed(),
+                just(T::Keyword(K::Add))
+                    .ignore_then(
+                        just(T::Keyword(K::Constraint))
+                            .ignore_then(identifier())
+                            .or_not(),
+                    )
+                    .then_ignore(just([T::Keyword(K::Primary), T::Keyword(K::Key)]))
+                    // ( field_list )
+                    .ignore_then(
+                        identifier()
+                            .separated_by(just(T::Symbol(',')))
+                            .collect()
+                            .delimited_by(just(T::Symbol('(')), just(T::Symbol(')'))),
+                    )
+                    .boxed(),
             )
             .map(|(table_ident, fields): (&str, Vec<&str>)| {
                 AlterStatement::AddPKey(
