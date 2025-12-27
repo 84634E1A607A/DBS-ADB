@@ -347,7 +347,7 @@ impl DatabaseManager {
 
     // Data operations
     pub fn insert(&mut self, table: &str, rows: Vec<Vec<ParserValue>>) -> DatabaseResult<usize> {
-        self.bulk_insert(table, rows, false)
+        self.bulk_insert(table, rows, false, false, false)
     }
 
     /// Optimized bulk insert function
@@ -365,6 +365,8 @@ impl DatabaseManager {
         table: &str,
         rows: Vec<Vec<ParserValue>>,
         skip_pk_check: bool,
+        skip_fk_check: bool,
+        skip_index_update: bool,
     ) -> DatabaseResult<usize> {
         let (table_meta, schema) = {
             let metadata = self
@@ -380,6 +382,8 @@ impl DatabaseManager {
         let db_name = self.current_db.as_ref().unwrap();
         let table_path = self.table_path(db_name, table);
         let table_path_str = table_path.to_string_lossy().to_string();
+        let db_path = self.data_dir.join(db_name);
+        let db_path_str = db_path.to_string_lossy().to_string();
 
         // Try to open table if not already open (ignore error if already open)
         let _ = self
@@ -510,11 +514,46 @@ impl DatabaseManager {
             }
         }
 
-        self.validate_foreign_keys_for_records(&table_meta, &records)?;
+        if !skip_fk_check {
+            self.validate_foreign_keys_for_records(&table_meta, &records)?;
+        }
+
+        let indexed_columns = if skip_index_update {
+            Vec::new()
+        } else {
+            self.open_indexed_columns(&db_path_str, &table_meta)?
+        };
+        let mut index_keys: Vec<Vec<Option<i64>>> = Vec::new();
+        if !indexed_columns.is_empty() {
+            index_keys.reserve(records.len());
+            for record in &records {
+                let mut row_keys = Vec::with_capacity(indexed_columns.len());
+                for (_, col_idx) in &indexed_columns {
+                    let key = match record.get(*col_idx) {
+                        Some(RecordValue::Int(val)) => Some(*val as i64),
+                        _ => None,
+                    };
+                    row_keys.push(key);
+                }
+                index_keys.push(row_keys);
+            }
+        }
 
         // Insert all records in one batch - much faster as it holds the lock only once
-        let _record_ids = self.record_manager.bulk_insert(table, records)?;
-        Ok(_record_ids.len())
+        let record_ids = self.record_manager.bulk_insert(table, records)?;
+
+        if !indexed_columns.is_empty() {
+            for (row_idx, rid) in record_ids.iter().enumerate() {
+                let row_keys = &index_keys[row_idx];
+                for (col_idx, (col_name, _)) in indexed_columns.iter().enumerate() {
+                    if let Some(key) = row_keys[col_idx] {
+                        self.index_manager.insert(table, col_name, key, *rid)?;
+                    }
+                }
+            }
+        }
+
+        Ok(record_ids.len())
     }
 
     pub fn delete(
@@ -534,6 +573,8 @@ impl DatabaseManager {
         };
 
         let db_name = self.current_db.as_ref().unwrap();
+        let db_path = self.data_dir.join(db_name);
+        let db_path_str = db_path.to_string_lossy().to_string();
         let table_path = self.table_path(db_name, table);
         let table_path_str = table_path.to_string_lossy().to_string();
 
@@ -542,7 +583,33 @@ impl DatabaseManager {
             .record_manager
             .open_table(&table_path_str, schema.clone());
 
-        let mut to_delete = Vec::new();
+        let referencing_checks = self.build_referencing_fk_checks(&table_meta)?;
+        if !referencing_checks.is_empty() {
+            let db_name = self
+                .current_db
+                .clone()
+                .ok_or(DatabaseError::NoDatabaseSelected)?;
+            let scan_iter = self.record_manager.scan_iter(table)?;
+            for item in scan_iter {
+                let (_rid, record) = item?;
+                let should_delete = match &where_clauses {
+                    None => true,
+                    Some(clauses) => self.evaluate_where(&record, &schema, clauses)?,
+                };
+
+                if should_delete {
+                    self.validate_foreign_keys_on_delete_record(
+                        &db_name,
+                        &db_path_str,
+                        &referencing_checks,
+                        &record,
+                    )?;
+                }
+            }
+        }
+
+        let indexed_columns = self.open_indexed_columns(&db_path_str, &table_meta)?;
+        let mut deleted = 0;
         let scan_iter = self.record_manager.scan_iter(table)?;
         for item in scan_iter {
             let (rid, record) = item?;
@@ -552,19 +619,18 @@ impl DatabaseManager {
             };
 
             if should_delete {
-                to_delete.push((rid, record));
+                self.record_manager.delete(table, rid)?;
+                if !indexed_columns.is_empty() {
+                    for (col_name, col_idx) in &indexed_columns {
+                        if let Some(RecordValue::Int(val)) = record.get(*col_idx) {
+                            let _ = self
+                                .index_manager
+                                .delete_entry(table, col_name, *val as i64, rid)?;
+                        }
+                    }
+                }
+                deleted += 1;
             }
-        }
-
-        if !to_delete.is_empty() {
-            let records: Vec<Record> = to_delete.iter().map(|(_, record)| record.clone()).collect();
-            self.validate_foreign_keys_on_delete(&table_meta, &records)?;
-        }
-
-        let mut deleted = 0;
-        for (rid, _record) in to_delete {
-            self.record_manager.delete(table, rid)?;
-            deleted += 1;
         }
 
         Ok(deleted)
@@ -590,6 +656,8 @@ impl DatabaseManager {
         let db_name = self.current_db.as_ref().unwrap();
         let table_path = self.table_path(db_name, table);
         let table_path_str = table_path.to_string_lossy().to_string();
+        let db_path = self.data_dir.join(db_name);
+        let db_path_str = db_path.to_string_lossy().to_string();
 
         // Try to open table if not already open (ignore error if already open)
         let _ = self
@@ -618,6 +686,11 @@ impl DatabaseManager {
                     .any(|idx| update_indices.contains(idx))
             });
 
+        let indexed_columns = if update_indices.is_empty() {
+            Vec::new()
+        } else {
+            self.open_indexed_columns(&db_path_str, &table_meta)?
+        };
         let mut updated = 0;
         let scan_iter = self.record_manager.scan_iter(table)?;
         for item in scan_iter {
@@ -628,6 +701,7 @@ impl DatabaseManager {
             };
 
             if should_update {
+                let original = record.clone();
                 // Apply updates
                 for (col_idx, new_value) in &update_map {
                     let data_type = &schema.columns[*col_idx].data_type;
@@ -648,7 +722,52 @@ impl DatabaseManager {
                     )?;
                 }
 
-                self.record_manager.update(table, rid, record)?;
+                let updated_record = record.clone();
+                self.record_manager.update(table, rid, updated_record)?;
+                if !indexed_columns.is_empty() {
+                    for (col_name, col_idx) in &indexed_columns {
+                        if !update_indices.contains(col_idx) {
+                            continue;
+                        }
+                        let old_val = original.get(*col_idx).unwrap();
+                        let new_val = record.get(*col_idx).unwrap();
+                        match (old_val, new_val) {
+                            (RecordValue::Int(old_key), RecordValue::Int(new_key)) => {
+                                if old_key != new_key {
+                                    let _ = self.index_manager.delete_entry(
+                                        table,
+                                        col_name,
+                                        *old_key as i64,
+                                        rid,
+                                    )?;
+                                    self.index_manager.insert(
+                                        table,
+                                        col_name,
+                                        *new_key as i64,
+                                        rid,
+                                    )?;
+                                }
+                            }
+                            (RecordValue::Int(old_key), _) => {
+                                let _ = self.index_manager.delete_entry(
+                                    table,
+                                    col_name,
+                                    *old_key as i64,
+                                    rid,
+                                )?;
+                            }
+                            (_, RecordValue::Int(new_key)) => {
+                                self.index_manager.insert(
+                                    table,
+                                    col_name,
+                                    *new_key as i64,
+                                    rid,
+                                )?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 updated += 1;
             }
         }
@@ -1000,8 +1119,13 @@ impl DatabaseManager {
 
                 // Insert batch when it reaches BATCH_SIZE
                 if batch_rows.len() >= BATCH_SIZE {
-                    total_inserted +=
-                        self.bulk_insert(table, std::mem::take(&mut batch_rows), true)?;
+                    total_inserted += self.bulk_insert(
+                        table,
+                        std::mem::take(&mut batch_rows),
+                        true,
+                        true,
+                        true,
+                    )?;
                     batch_rows.reserve(BATCH_SIZE); // Prepare for next batch
 
                     // Flush and clear buffer pool periodically to prevent memory buildup
@@ -1014,7 +1138,7 @@ impl DatabaseManager {
 
         // Insert remaining rows
         if !batch_rows.is_empty() {
-            total_inserted += self.bulk_insert(table, batch_rows, true)?;
+            total_inserted += self.bulk_insert(table, batch_rows, true, true, true)?;
             // Final flush after last batch
             self.buffer_manager.lock().unwrap().flush_and_clear()?;
         }
@@ -1419,102 +1543,86 @@ impl DatabaseManager {
         Ok(checks)
     }
 
-    fn validate_foreign_keys_on_delete(
+    fn validate_foreign_keys_on_delete_record(
         &mut self,
-        parent_meta: &TableMetadata,
-        records: &[Record],
+        db_name: &str,
+        db_path_str: &str,
+        referencing_checks: &[ReferencingForeignKeyCheck],
+        record: &Record,
     ) -> DatabaseResult<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-
-        let referencing_checks = self.build_referencing_fk_checks(parent_meta)?;
-        if referencing_checks.is_empty() {
-            return Ok(());
-        }
-
-        let db_name = self
-            .current_db
-            .clone()
-            .ok_or(DatabaseError::NoDatabaseSelected)?;
-        let db_path = self.data_dir.join(&db_name);
-        let db_path_str = db_path.to_string_lossy().to_string();
-
-        for record in records {
-            for fk in &referencing_checks {
-                let mut values = Vec::with_capacity(fk.parent_column_indices.len());
-                let mut has_null = false;
-                for col_idx in &fk.parent_column_indices {
-                    let value = record.get(*col_idx).unwrap();
-                    if value.is_null() {
-                        has_null = true;
-                        break;
-                    }
-                    values.push(value.clone());
+        for fk in referencing_checks {
+            let mut values = Vec::with_capacity(fk.parent_column_indices.len());
+            let mut has_null = false;
+            for col_idx in &fk.parent_column_indices {
+                let value = record.get(*col_idx).unwrap();
+                if value.is_null() {
+                    has_null = true;
+                    break;
                 }
+                values.push(value.clone());
+            }
 
-                if has_null {
-                    continue;
-                }
+            if has_null {
+                continue;
+            }
 
-                if fk.child_column_indices.len() == 1 && fk.parent_column_indices.len() == 1 {
-                    let fk_value = match values[0] {
-                        RecordValue::Int(v) => v as i64,
-                        _ => {
-                            return Err(DatabaseError::TypeMismatch(
-                                "Foreign key column must be INT".to_string(),
-                            ))
-                        }
-                    };
-
-                    let mut used_index = false;
-                    let mut index_found = false;
-                    match self.index_manager.open_index(
-                        &db_path_str,
-                        &fk.child_table,
-                        &fk.child_column_names[0],
-                    ) {
-                        Ok(()) => {
-                            used_index = true;
-                            index_found = self
-                                .index_manager
-                                .search(&fk.child_table, &fk.child_column_names[0], fk_value)
-                                .is_some();
-                        }
-                        Err(IndexError::IndexNotFound(_)) => {}
-                        Err(err) => return Err(DatabaseError::IndexError(err)),
-                    };
-
-                    if used_index && index_found {
-                        return Err(self.foreign_key_delete_error(fk, &values));
+            if fk.child_column_indices.len() == 1 && fk.parent_column_indices.len() == 1 {
+                let fk_value = match values[0] {
+                    RecordValue::Int(v) => v as i64,
+                    _ => {
+                        return Err(DatabaseError::TypeMismatch(
+                            "Foreign key column must be INT".to_string(),
+                        ))
                     }
-                }
+                };
 
-                let table_path = self.table_path(&db_name, &fk.child_table);
-                let _ = self
-                    .record_manager
-                    .open_table(&table_path.to_string_lossy(), fk.child_schema.clone());
-                let scan_iter = self.record_manager.scan_iter(&fk.child_table)?;
-                let mut found = false;
-                for item in scan_iter {
-                    let (_rid, child_record) = item?;
-                    let mut matches = true;
-                    for (idx, value) in fk.child_column_indices.iter().zip(values.iter()) {
-                        let child_value = child_record.get(*idx).unwrap();
-                        if child_value.is_null() || child_value != value {
-                            matches = false;
-                            break;
-                        }
+                let mut used_index = false;
+                let mut index_found = false;
+                match self.index_manager.open_index(
+                    db_path_str,
+                    &fk.child_table,
+                    &fk.child_column_names[0],
+                ) {
+                    Ok(()) => {
+                        used_index = true;
+                        index_found = self
+                            .index_manager
+                            .search(&fk.child_table, &fk.child_column_names[0], fk_value)
+                            .is_some();
                     }
-                    if matches {
-                        found = true;
-                        break;
-                    }
-                }
+                    Err(IndexError::IndexNotFound(_)) => {}
+                    Err(err) => return Err(DatabaseError::IndexError(err)),
+                };
 
-                if found {
+                if used_index && index_found {
                     return Err(self.foreign_key_delete_error(fk, &values));
                 }
+            }
+
+            let table_path = self.table_path(db_name, &fk.child_table);
+            let _ = self
+                .record_manager
+                .open_table(&table_path.to_string_lossy(), fk.child_schema.clone());
+            let scan_iter = self.record_manager.scan_iter(&fk.child_table)?;
+            let mut found = false;
+            for item in scan_iter {
+                let (_rid, child_record) = item?;
+                let mut matches = true;
+                for (idx, value) in fk.child_column_indices.iter().zip(values.iter()) {
+                    let child_value = child_record.get(*idx).unwrap();
+                    if child_value.is_null() || child_value != value {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    found = true;
+                    break;
+                }
+            }
+
+            if found {
+                return Err(self.foreign_key_delete_error(fk, &values));
             }
         }
 
@@ -1547,6 +1655,49 @@ impl DatabaseManager {
             ParserValue::Float(f) => RecordValue::Float(*f),
             ParserValue::String(s) => RecordValue::String(s.clone()),
         }
+    }
+
+    fn open_indexed_columns(
+        &mut self,
+        db_path: &str,
+        table_meta: &TableMetadata,
+    ) -> DatabaseResult<Vec<(String, usize)>> {
+        let mut columns = Vec::new();
+        let mut seen = HashSet::new();
+        let mut candidates = Vec::new();
+
+        if let Some(pk_cols) = &table_meta.primary_key {
+            candidates.extend(pk_cols.iter().cloned());
+        }
+        for index_meta in &table_meta.indexes {
+            candidates.extend(index_meta.columns.iter().cloned());
+        }
+
+        for col_name in candidates {
+            if !seen.insert(col_name.clone()) {
+                continue;
+            }
+            let col_idx = table_meta
+                .columns
+                .iter()
+                .position(|c| c.name == col_name)
+                .ok_or_else(|| {
+                    DatabaseError::ColumnNotFound(col_name.clone(), table_meta.name.clone())
+                })?;
+            if table_meta.columns[col_idx].to_data_type() != DataType::Int {
+                continue;
+            }
+            match self
+                .index_manager
+                .open_index(db_path, &table_meta.name, &col_name)
+            {
+                Ok(()) => columns.push((col_name, col_idx)),
+                Err(IndexError::IndexNotFound(_)) => {}
+                Err(err) => return Err(DatabaseError::IndexError(err)),
+            }
+        }
+
+        Ok(columns)
     }
 
     fn resolve_single_column_index(
