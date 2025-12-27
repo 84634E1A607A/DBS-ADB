@@ -137,4 +137,13 @@ impl RecordManager {
             .ok_or_else(|| RecordError::TableNotOpen(table_name.to_string()))?;
         table.scan(&mut buffer_manager)
     }
+
+    /// Create a streaming iterator over all records in a table.
+    pub fn scan_iter(&self, table_name: &str) -> RecordResult<TableScanIter> {
+        let table = self
+            .open_tables
+            .get(table_name)
+            .ok_or_else(|| RecordError::TableNotOpen(table_name.to_string()))?;
+        Ok(table.scan_iter(self.buffer_manager.clone()))
+    }
 }

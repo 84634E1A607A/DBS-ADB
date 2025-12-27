@@ -500,11 +500,10 @@ impl DatabaseManager {
             .record_manager
             .open_table(&table_path_str, schema.clone());
 
-        // Scan and find matching records
-        let records = self.record_manager.scan(table)?;
-
         let mut deleted = 0;
-        for (rid, record) in records {
+        let scan_iter = self.record_manager.scan_iter(table)?;
+        for item in scan_iter {
+            let (rid, record) = item?;
             let should_delete = match &where_clauses {
                 None => true,
                 Some(clauses) => self.evaluate_where(&record, &schema, clauses)?,
@@ -558,11 +557,10 @@ impl DatabaseManager {
             update_map.insert(col_idx, value);
         }
 
-        // Scan and update matching records
-        let records = self.record_manager.scan(table)?;
-
         let mut updated = 0;
-        for (rid, mut record) in records {
+        let scan_iter = self.record_manager.scan_iter(table)?;
+        for item in scan_iter {
+            let (rid, mut record) = item?;
             let should_update = match &where_clauses {
                 None => true,
                 Some(clauses) => self.evaluate_where(&record, &schema, clauses)?,
@@ -608,11 +606,9 @@ impl DatabaseManager {
         let table_path = self.table_path(db_name, table_name);
         let table_path_str = table_path.to_string_lossy().to_string();
 
-        // Try to open table if not already open (ignore error if already open)
-        if self.record_manager.scan(table_name).is_err() {
-            self.record_manager
-                .open_table(&table_path_str, schema.clone())?;
-        }
+        // Open table if not already open
+        self.record_manager
+            .open_table(&table_path_str, schema.clone())?;
 
         // Determine selected columns
         let selected_columns = match &clause.selectors {
@@ -649,19 +645,12 @@ impl DatabaseManager {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Ensure table is open
-        let table_path_str = table_path.to_string_lossy().to_string();
-        if self.record_manager.scan(table_name).is_err() {
-            // Table not open, open it
-            self.record_manager
-                .open_table(&table_path_str, schema.clone())?;
-        }
-
-        // Scan table
-        let records = self.record_manager.scan(table_name)?;
+        // Scan table using streaming iterator
+        let scan_iter = self.record_manager.scan_iter(table_name)?;
 
         let mut result_rows = Vec::new();
-        for (_rid, record) in records {
+        for item in scan_iter {
+            let (_rid, record) = item?;
             // Evaluate WHERE clause
             let matches = match &clause.where_clauses {
                 clauses if clauses.is_empty() => true,

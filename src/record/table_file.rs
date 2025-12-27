@@ -231,7 +231,7 @@ impl TableFile {
 
     /// Create a streaming iterator over all records in the table.
     /// This avoids loading the entire table into memory at once.
-    pub fn scan_iter(self, buffer_manager: Arc<Mutex<BufferManager>>) -> TableScanIter {
+    pub fn scan_iter(&self, buffer_manager: Arc<Mutex<BufferManager>>) -> TableScanIter {
         TableScanIter::new(self, buffer_manager)
     }
 
@@ -259,7 +259,9 @@ impl TableFile {
 
 /// Streaming table scan iterator (yields records one-by-one).
 pub struct TableScanIter {
-    table: TableFile,
+    file_handle: FileHandle,
+    schema: TableSchema,
+    page_count: usize,
     buffer_manager: Arc<Mutex<BufferManager>>,
     page_id: PageId,
     slot_id: usize,
@@ -267,10 +269,12 @@ pub struct TableScanIter {
 }
 
 impl TableScanIter {
-    fn new(table: TableFile, buffer_manager: Arc<Mutex<BufferManager>>) -> Self {
+    fn new(table: &TableFile, buffer_manager: Arc<Mutex<BufferManager>>) -> Self {
         Self {
+            file_handle: table.file_handle,
+            schema: table.schema.clone(),
+            page_count: table.page_count,
             page_id: table.first_page_id,
-            table,
             buffer_manager,
             slot_id: 0,
             done: false,
@@ -287,13 +291,13 @@ impl Iterator for TableScanIter {
         }
 
         loop {
-            if self.page_id >= self.table.page_count {
+            if self.page_id >= self.page_count {
                 self.done = true;
                 return None;
             }
 
             let mut buffer_manager = self.buffer_manager.lock().unwrap();
-            let page_buffer = match buffer_manager.get_page_mut(self.table.file_handle, self.page_id)
+            let page_buffer = match buffer_manager.get_page_mut(self.file_handle, self.page_id)
             {
                 Ok(buf) => buf,
                 Err(err) => return Some(Err(err.into())),
@@ -310,7 +314,7 @@ impl Iterator for TableScanIter {
                         Ok(bytes) => bytes,
                         Err(err) => return Some(Err(err)),
                     };
-                    let record = match Record::deserialize(record_bytes, &self.table.schema) {
+                    let record = match Record::deserialize(record_bytes, &self.schema) {
                         Ok(record) => record,
                         Err(err) => return Some(Err(err)),
                     };
