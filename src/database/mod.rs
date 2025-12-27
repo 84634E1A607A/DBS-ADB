@@ -12,8 +12,8 @@ use crate::catalog::{
 use crate::file::{BufferManager, PagedFileManager};
 use crate::index::IndexManager;
 use crate::lexer_parser::{
-    AlterStatement, CreateTableField, DBStatement, Operator, SelectClause, Selectors,
-    TableStatement, Value as ParserValue, WhereClause,
+    AlterStatement, CreateTableField, DBStatement, Expression, Operator, SelectClause, Selector,
+    Selectors, TableColumn, TableStatement, Value as ParserValue, WhereClause,
 };
 use crate::record::{
     ColumnDef, DataType, Record, RecordId, RecordManager, TableFile, TableScanIter, TableSchema,
@@ -110,6 +110,18 @@ impl Iterator for TableIntColumnIter {
             }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum JoinSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy)]
+struct JoinColumnRef {
+    side: JoinSide,
+    index: usize,
 }
 
 impl DatabaseManager {
@@ -587,17 +599,23 @@ impl DatabaseManager {
         &mut self,
         clause: SelectClause,
     ) -> DatabaseResult<(Vec<String>, Vec<Vec<String>>)> {
+        match clause.table.len() {
+            1 => self.select_single_table(clause),
+            2 => self.select_two_table_join(clause),
+            _ => Err(DatabaseError::TypeMismatch(
+                "Only single-table and two-table queries are supported".to_string(),
+            )),
+        }
+    }
+
+    fn select_single_table(
+        &mut self,
+        clause: SelectClause,
+    ) -> DatabaseResult<(Vec<String>, Vec<Vec<String>>)> {
         let metadata = self
             .current_metadata
             .as_ref()
             .ok_or(DatabaseError::NoDatabaseSelected)?;
-
-        // For now, only support single table queries
-        if clause.table.len() != 1 {
-            return Err(DatabaseError::TypeMismatch(
-                "Multi-table queries not yet supported".to_string(),
-            ));
-        }
 
         let table_name = &clause.table[0];
         let table_meta = metadata.get_table(table_name)?;
@@ -611,15 +629,21 @@ impl DatabaseManager {
         self.record_manager
             .open_table(&table_path_str, schema.clone())?;
 
-        // Determine selected columns
-        let selected_columns = match &clause.selectors {
-            Selectors::All => schema.columns.iter().map(|c| c.name.clone()).collect(),
+        let (selected_columns, col_indices) = match &clause.selectors {
+            Selectors::All => {
+                let columns = schema.columns.iter().map(|c| c.name.clone()).collect();
+                let indices = (0..schema.columns.len()).collect();
+                (columns, indices)
+            }
             Selectors::List(selectors) => {
-                let mut cols = Vec::new();
+                let mut columns = Vec::new();
+                let mut indices = Vec::new();
                 for selector in selectors {
                     match selector {
-                        crate::lexer_parser::Selector::Column(tc) => {
-                            cols.push(tc.column.clone());
+                        Selector::Column(tc) => {
+                            let col_idx = self.resolve_single_column_index(&schema, tc)?;
+                            columns.push(tc.column.clone());
+                            indices.push(col_idx);
                         }
                         _ => {
                             return Err(DatabaseError::TypeMismatch(
@@ -628,23 +652,9 @@ impl DatabaseManager {
                         }
                     }
                 }
-                cols
+                (columns, indices)
             }
         };
-
-        // Get column indices
-        let col_indices: Vec<usize> = selected_columns
-            .iter()
-            .map(|col_name| {
-                schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name == *col_name)
-                    .ok_or_else(|| {
-                        DatabaseError::ColumnNotFound(col_name.clone(), table_name.clone())
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
 
         // Scan table using streaming iterator
         let scan_iter = self.record_manager.scan_iter(table_name)?;
@@ -666,6 +676,126 @@ impl DatabaseManager {
                     row.push(self.format_value(value));
                 }
                 result_rows.push(row);
+            }
+        }
+
+        Ok((selected_columns, result_rows))
+    }
+
+    fn select_two_table_join(
+        &mut self,
+        clause: SelectClause,
+    ) -> DatabaseResult<(Vec<String>, Vec<Vec<String>>)> {
+        let (left_name, right_name) = (&clause.table[0], &clause.table[1]);
+
+        let (left_meta, right_meta) = {
+            let metadata = self
+                .current_metadata
+                .as_ref()
+                .ok_or(DatabaseError::NoDatabaseSelected)?;
+            (
+                metadata.get_table(left_name)?.clone(),
+                metadata.get_table(right_name)?.clone(),
+            )
+        };
+
+        let left_schema = self.metadata_to_schema(&left_meta);
+        let right_schema = self.metadata_to_schema(&right_meta);
+
+        let db_name = self.current_db.as_ref().unwrap();
+        let left_path = self.table_path(db_name, left_name);
+        let right_path = self.table_path(db_name, right_name);
+        let left_path_str = left_path.to_string_lossy().to_string();
+        let right_path_str = right_path.to_string_lossy().to_string();
+
+        // Open tables if not already open
+        self.record_manager
+            .open_table(&left_path_str, left_schema.clone())?;
+        self.record_manager
+            .open_table(&right_path_str, right_schema.clone())?;
+
+        // Materialize the right table to keep join logic simple.
+        let right_rows = self.record_manager.scan(right_name)?;
+        let right_records: Vec<Record> = right_rows.into_iter().map(|(_, r)| r).collect();
+
+        let (selected_columns, col_refs) = match &clause.selectors {
+            Selectors::All => {
+                let mut columns = Vec::new();
+                let mut refs = Vec::new();
+                for (idx, col) in left_schema.columns.iter().enumerate() {
+                    columns.push(col.name.clone());
+                    refs.push(JoinColumnRef {
+                        side: JoinSide::Left,
+                        index: idx,
+                    });
+                }
+                for (idx, col) in right_schema.columns.iter().enumerate() {
+                    columns.push(col.name.clone());
+                    refs.push(JoinColumnRef {
+                        side: JoinSide::Right,
+                        index: idx,
+                    });
+                }
+                (columns, refs)
+            }
+            Selectors::List(selectors) => {
+                let mut columns = Vec::new();
+                let mut refs = Vec::new();
+                for selector in selectors {
+                    match selector {
+                        Selector::Column(tc) => {
+                            let col_ref = self.resolve_join_column_ref(
+                                tc,
+                                left_name,
+                                &left_schema,
+                                right_name,
+                                &right_schema,
+                            )?;
+                            columns.push(tc.column.clone());
+                            refs.push(col_ref);
+                        }
+                        _ => {
+                            return Err(DatabaseError::TypeMismatch(
+                                "Aggregates not yet supported".to_string(),
+                            ));
+                        }
+                    }
+                }
+                (columns, refs)
+            }
+        };
+
+        let scan_iter = self.record_manager.scan_iter(left_name)?;
+        let mut result_rows = Vec::new();
+
+        for item in scan_iter {
+            let (_rid, left_record) = item?;
+            for right_record in &right_records {
+                let matches = if clause.where_clauses.is_empty() {
+                    true
+                } else {
+                    self.evaluate_join_where(
+                        &left_record,
+                        &left_schema,
+                        left_name,
+                        right_record,
+                        &right_schema,
+                        right_name,
+                        &clause.where_clauses,
+                    )?
+                };
+
+                if matches {
+                    let mut row = Vec::new();
+                    for col_ref in &col_refs {
+                        let value = match col_ref.side {
+                            JoinSide::Left => left_record.get(col_ref.index).unwrap(),
+                            JoinSide::Right => right_record.get(col_ref.index).unwrap(),
+                        };
+                        row.push(self.format_value(value));
+                    }
+                    result_rows.push(row);
+                }
             }
         }
 
@@ -921,6 +1051,93 @@ impl DatabaseManager {
         }
     }
 
+    fn resolve_single_column_index(
+        &self,
+        schema: &TableSchema,
+        column: &TableColumn,
+    ) -> DatabaseResult<usize> {
+        if let Some(table) = &column.table {
+            if table != &schema.table_name {
+                return Err(DatabaseError::ColumnNotFound(
+                    column.column.clone(),
+                    table.clone(),
+                ));
+            }
+        }
+
+        schema
+            .columns
+            .iter()
+            .position(|c| c.name == column.column)
+            .ok_or_else(|| {
+                DatabaseError::ColumnNotFound(column.column.clone(), schema.table_name.clone())
+            })
+    }
+
+    fn resolve_join_column_ref(
+        &self,
+        column: &TableColumn,
+        left_name: &str,
+        left_schema: &TableSchema,
+        right_name: &str,
+        right_schema: &TableSchema,
+    ) -> DatabaseResult<JoinColumnRef> {
+        let left_idx = left_schema
+            .columns
+            .iter()
+            .position(|c| c.name == column.column);
+        let right_idx = right_schema
+            .columns
+            .iter()
+            .position(|c| c.name == column.column);
+
+        if let Some(table) = &column.table {
+            if table == left_name {
+                return left_idx
+                    .map(|index| JoinColumnRef {
+                        side: JoinSide::Left,
+                        index,
+                    })
+                    .ok_or_else(|| {
+                        DatabaseError::ColumnNotFound(column.column.clone(), left_name.to_string())
+                    });
+            }
+            if table == right_name {
+                return right_idx
+                    .map(|index| JoinColumnRef {
+                        side: JoinSide::Right,
+                        index,
+                    })
+                    .ok_or_else(|| {
+                        DatabaseError::ColumnNotFound(column.column.clone(), right_name.to_string())
+                    });
+            }
+            return Err(DatabaseError::ColumnNotFound(
+                column.column.clone(),
+                table.clone(),
+            ));
+        }
+
+        match (left_idx, right_idx) {
+            (Some(index), None) => Ok(JoinColumnRef {
+                side: JoinSide::Left,
+                index,
+            }),
+            (None, Some(index)) => Ok(JoinColumnRef {
+                side: JoinSide::Right,
+                index,
+            }),
+            (Some(_), Some(_)) => Err(DatabaseError::TypeMismatch(format!(
+                "Ambiguous column {}",
+                column.column
+            ))),
+            (None, None) => Err(DatabaseError::ColumnNotFound(
+                column.column.clone(),
+                left_name.to_string(),
+            )),
+        }
+    }
+
     fn evaluate_where(
         &self,
         record: &Record,
@@ -931,25 +1148,16 @@ impl DatabaseManager {
         for clause in where_clauses {
             match clause {
                 WhereClause::Op(col, op, expr) => {
-                    let col_idx = schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name == col.column)
-                        .ok_or_else(|| {
-                            DatabaseError::ColumnNotFound(
-                                col.column.clone(),
-                                schema.table_name.clone(),
-                            )
-                        })?;
+                    let col_idx = self.resolve_single_column_index(schema, col)?;
 
                     let left_val = record.get(col_idx).unwrap();
 
                     let right_val = match expr {
-                        crate::lexer_parser::Expression::Value(v) => {
+                        Expression::Value(v) => {
                             let data_type = &schema.columns[col_idx].data_type;
                             self.parser_value_to_record_value(v, data_type)
                         }
-                        crate::lexer_parser::Expression::Column(_) => {
+                        Expression::Column(_) => {
                             return Err(DatabaseError::TypeMismatch(
                                 "Column expressions not yet supported".to_string(),
                             ));
@@ -961,32 +1169,124 @@ impl DatabaseManager {
                     }
                 }
                 WhereClause::Null(col) => {
-                    let col_idx = schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name == col.column)
-                        .ok_or_else(|| {
-                            DatabaseError::ColumnNotFound(
-                                col.column.clone(),
-                                schema.table_name.clone(),
-                            )
-                        })?;
+                    let col_idx = self.resolve_single_column_index(schema, col)?;
                     if !record.get(col_idx).unwrap().is_null() {
                         return Ok(false);
                     }
                 }
                 WhereClause::NotNull(col) => {
-                    let col_idx = schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name == col.column)
-                        .ok_or_else(|| {
-                            DatabaseError::ColumnNotFound(
-                                col.column.clone(),
-                                schema.table_name.clone(),
-                            )
-                        })?;
+                    let col_idx = self.resolve_single_column_index(schema, col)?;
                     if record.get(col_idx).unwrap().is_null() {
+                        return Ok(false);
+                    }
+                }
+                _ => {
+                    return Err(DatabaseError::TypeMismatch(
+                        "WHERE clause type not yet supported".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn join_value_and_type<'a>(
+        &self,
+        column: &TableColumn,
+        left_record: &'a Record,
+        left_schema: &'a TableSchema,
+        left_name: &str,
+        right_record: &'a Record,
+        right_schema: &'a TableSchema,
+        right_name: &str,
+    ) -> DatabaseResult<(&'a RecordValue, &'a DataType)> {
+        let col_ref = self.resolve_join_column_ref(
+            column,
+            left_name,
+            left_schema,
+            right_name,
+            right_schema,
+        )?;
+
+        let (record, schema) = match col_ref.side {
+            JoinSide::Left => (left_record, left_schema),
+            JoinSide::Right => (right_record, right_schema),
+        };
+
+        let value = record.get(col_ref.index).unwrap();
+        let data_type = &schema.columns[col_ref.index].data_type;
+        Ok((value, data_type))
+    }
+
+    fn evaluate_join_where(
+        &self,
+        left_record: &Record,
+        left_schema: &TableSchema,
+        left_name: &str,
+        right_record: &Record,
+        right_schema: &TableSchema,
+        right_name: &str,
+        where_clauses: &[WhereClause],
+    ) -> DatabaseResult<bool> {
+        for clause in where_clauses {
+            match clause {
+                WhereClause::Op(col, op, expr) => {
+                    let (left_val, data_type) = self.join_value_and_type(
+                        col,
+                        left_record,
+                        left_schema,
+                        left_name,
+                        right_record,
+                        right_schema,
+                        right_name,
+                    )?;
+
+                    let right_val = match expr {
+                        Expression::Value(v) => self.parser_value_to_record_value(v, data_type),
+                        Expression::Column(tc) => {
+                            let (value, _) = self.join_value_and_type(
+                                tc,
+                                left_record,
+                                left_schema,
+                                left_name,
+                                right_record,
+                                right_schema,
+                                right_name,
+                            )?;
+                            value.clone()
+                        }
+                    };
+
+                    if !self.compare_values(left_val, op, &right_val) {
+                        return Ok(false);
+                    }
+                }
+                WhereClause::Null(col) => {
+                    let (value, _) = self.join_value_and_type(
+                        col,
+                        left_record,
+                        left_schema,
+                        left_name,
+                        right_record,
+                        right_schema,
+                        right_name,
+                    )?;
+                    if !value.is_null() {
+                        return Ok(false);
+                    }
+                }
+                WhereClause::NotNull(col) => {
+                    let (value, _) = self.join_value_and_type(
+                        col,
+                        left_record,
+                        left_schema,
+                        left_name,
+                        right_record,
+                        right_schema,
+                        right_name,
+                    )?;
+                    if value.is_null() {
                         return Ok(false);
                     }
                 }

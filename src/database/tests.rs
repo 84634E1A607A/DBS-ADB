@@ -1,5 +1,8 @@
 use super::*;
-use crate::lexer_parser::{AlterStatement, ColumnType, CreateTableField, Selectors, WhereClause};
+use crate::lexer_parser::{
+    AlterStatement, ColumnType, CreateTableField, Expression, Operator, SelectClause, Selector,
+    Selectors, TableColumn, WhereClause,
+};
 use tempfile::TempDir;
 
 fn setup_test_db() -> (TempDir, DatabaseManager) {
@@ -741,6 +744,115 @@ fn test_varchar_as_fixed_char() {
     assert_eq!(rows.len(), 1);
     // String should be trimmed when displayed
     assert_eq!(rows[0][0], "hi");
+}
+
+#[test]
+fn test_two_table_join_basic() {
+    let (_temp, mut db_manager) = setup_test_db();
+
+    db_manager.create_database("testdb").unwrap();
+    db_manager.use_database("testdb").unwrap();
+
+    let fields1 = vec![
+        CreateTableField::Col("a".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Col(
+            "b".to_string(),
+            ColumnType::Char(10),
+            true,
+            ParserValue::Null,
+        ),
+    ];
+    let fields2 = vec![
+        CreateTableField::Col("a".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Col(
+            "c".to_string(),
+            ColumnType::Char(10),
+            true,
+            ParserValue::Null,
+        ),
+    ];
+
+    db_manager.create_table("t1", fields1).unwrap();
+    db_manager.create_table("t2", fields2).unwrap();
+
+    let rows_t1 = vec![
+        vec![
+            ParserValue::Integer(1),
+            ParserValue::String("x".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(2),
+            ParserValue::String("y".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(3),
+            ParserValue::String("z".to_string()),
+        ],
+    ];
+    let rows_t2 = vec![
+        vec![
+            ParserValue::Integer(2),
+            ParserValue::String("p".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(3),
+            ParserValue::String("q".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(4),
+            ParserValue::String("r".to_string()),
+        ],
+    ];
+
+    db_manager.insert("t1", rows_t1).unwrap();
+    db_manager.insert("t2", rows_t2).unwrap();
+
+    let clause = SelectClause {
+        selectors: Selectors::List(vec![
+            Selector::Column(TableColumn {
+                table: Some("t1".to_string()),
+                column: "a".to_string(),
+            }),
+            Selector::Column(TableColumn {
+                table: Some("t1".to_string()),
+                column: "b".to_string(),
+            }),
+            Selector::Column(TableColumn {
+                table: Some("t2".to_string()),
+                column: "a".to_string(),
+            }),
+            Selector::Column(TableColumn {
+                table: Some("t2".to_string()),
+                column: "c".to_string(),
+            }),
+        ]),
+        table: vec!["t1".to_string(), "t2".to_string()],
+        where_clauses: vec![WhereClause::Op(
+            TableColumn {
+                table: Some("t1".to_string()),
+                column: "a".to_string(),
+            },
+            Operator::Eq,
+            Expression::Column(TableColumn {
+                table: Some("t2".to_string()),
+                column: "a".to_string(),
+            }),
+        )],
+        group_by: None,
+        order_by: None,
+        limit: None,
+        offset: None,
+    };
+
+    let (headers, rows) = db_manager.select(clause).unwrap();
+    assert_eq!(headers, vec!["a", "b", "a", "c"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec!["2".to_string(), "y".to_string(), "2".to_string(), "p".to_string()],
+            vec!["3".to_string(), "z".to_string(), "3".to_string(), "q".to_string()],
+        ]
+    );
 }
 
 #[test]
