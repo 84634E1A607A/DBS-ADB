@@ -125,6 +125,17 @@ struct ForeignKeyCheck {
     ref_schema: TableSchema,
 }
 
+struct ReferencingForeignKeyCheck {
+    child_table: String,
+    child_column_names: Vec<String>,
+    child_column_indices: Vec<usize>,
+    child_schema: TableSchema,
+    parent_table: String,
+    parent_column_names: Vec<String>,
+    parent_column_indices: Vec<usize>,
+    fk_name: String,
+}
+
 #[derive(Clone, Copy)]
 enum JoinSide {
     Left,
@@ -511,13 +522,16 @@ impl DatabaseManager {
         table: &str,
         where_clauses: Option<Vec<WhereClause>>,
     ) -> DatabaseResult<usize> {
-        let metadata = self
-            .current_metadata
-            .as_ref()
-            .ok_or(DatabaseError::NoDatabaseSelected)?;
+        let (table_meta, schema) = {
+            let metadata = self
+                .current_metadata
+                .as_ref()
+                .ok_or(DatabaseError::NoDatabaseSelected)?;
 
-        let table_meta = metadata.get_table(table)?;
-        let schema = self.metadata_to_schema(table_meta);
+            let table_meta = metadata.get_table(table)?.clone();
+            let schema = self.metadata_to_schema(&table_meta);
+            (table_meta, schema)
+        };
 
         let db_name = self.current_db.as_ref().unwrap();
         let table_path = self.table_path(db_name, table);
@@ -528,7 +542,7 @@ impl DatabaseManager {
             .record_manager
             .open_table(&table_path_str, schema.clone());
 
-        let mut deleted = 0;
+        let mut to_delete = Vec::new();
         let scan_iter = self.record_manager.scan_iter(table)?;
         for item in scan_iter {
             let (rid, record) = item?;
@@ -538,9 +552,19 @@ impl DatabaseManager {
             };
 
             if should_delete {
-                self.record_manager.delete(table, rid)?;
-                deleted += 1;
+                to_delete.push((rid, record));
             }
+        }
+
+        if !to_delete.is_empty() {
+            let records: Vec<Record> = to_delete.iter().map(|(_, record)| record.clone()).collect();
+            self.validate_foreign_keys_on_delete(&table_meta, &records)?;
+        }
+
+        let mut deleted = 0;
+        for (rid, _record) in to_delete {
+            self.record_manager.delete(table, rid)?;
+            deleted += 1;
         }
 
         Ok(deleted)
@@ -1161,6 +1185,27 @@ impl DatabaseManager {
         ))
     }
 
+    fn foreign_key_delete_error(
+        &self,
+        fk: &ReferencingForeignKeyCheck,
+        values: &[RecordValue],
+    ) -> DatabaseError {
+        let value_desc = values
+            .iter()
+            .map(|value| format!("{:?}", value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        DatabaseError::ForeignKeyViolation(format!(
+            "delete violates {}: {}({}) referenced by {}({}) with value {}",
+            fk.fk_name,
+            fk.parent_table,
+            fk.parent_column_names.join(", "),
+            fk.child_table,
+            fk.child_column_names.join(", "),
+            value_desc
+        ))
+    }
+
     fn validate_foreign_keys_for_records(
         &mut self,
         table_meta: &TableMetadata,
@@ -1282,6 +1327,194 @@ impl DatabaseManager {
 
             if !found {
                 return Err(self.foreign_key_error(fk, &values));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn build_referencing_fk_checks(
+        &self,
+        parent_meta: &TableMetadata,
+    ) -> DatabaseResult<Vec<ReferencingForeignKeyCheck>> {
+        let metadata = self
+            .current_metadata
+            .as_ref()
+            .ok_or(DatabaseError::NoDatabaseSelected)?;
+
+        let mut checks = Vec::new();
+        for child_meta in metadata.tables.values() {
+            for fk in &child_meta.foreign_keys {
+                if fk.ref_table != parent_meta.name {
+                    continue;
+                }
+
+                if fk.columns.len() != fk.ref_columns.len() {
+                    return Err(DatabaseError::TypeMismatch(
+                        "Foreign key column count mismatch".to_string(),
+                    ));
+                }
+
+                let mut child_column_indices = Vec::with_capacity(fk.columns.len());
+                for col_name in &fk.columns {
+                    let idx = child_meta
+                        .columns
+                        .iter()
+                        .position(|c| &c.name == col_name)
+                        .ok_or_else(|| {
+                            DatabaseError::ColumnNotFound(
+                                col_name.clone(),
+                                child_meta.name.clone(),
+                            )
+                        })?;
+                    child_column_indices.push(idx);
+                }
+
+                let mut parent_column_indices = Vec::with_capacity(fk.ref_columns.len());
+                for col_name in &fk.ref_columns {
+                    let idx = parent_meta
+                        .columns
+                        .iter()
+                        .position(|c| &c.name == col_name)
+                        .ok_or_else(|| {
+                            DatabaseError::ColumnNotFound(
+                                col_name.clone(),
+                                parent_meta.name.clone(),
+                            )
+                        })?;
+                    parent_column_indices.push(idx);
+                }
+
+                for (pos, (child_idx, parent_idx)) in child_column_indices
+                    .iter()
+                    .zip(parent_column_indices.iter())
+                    .enumerate()
+                {
+                    let child_type = child_meta.columns[*child_idx].to_data_type();
+                    let parent_type = parent_meta.columns[*parent_idx].to_data_type();
+                    if child_type != parent_type {
+                        return Err(DatabaseError::TypeMismatch(format!(
+                            "Foreign key column type mismatch: {}.{} vs {}.{}",
+                            child_meta.name,
+                            fk.columns[pos],
+                            parent_meta.name,
+                            fk.ref_columns[pos]
+                        )));
+                    }
+                }
+
+                checks.push(ReferencingForeignKeyCheck {
+                    child_table: child_meta.name.clone(),
+                    child_column_names: fk.columns.clone(),
+                    child_column_indices,
+                    child_schema: self.metadata_to_schema(child_meta),
+                    parent_table: parent_meta.name.clone(),
+                    parent_column_names: fk.ref_columns.clone(),
+                    parent_column_indices,
+                    fk_name: fk.name.clone(),
+                });
+            }
+        }
+
+        Ok(checks)
+    }
+
+    fn validate_foreign_keys_on_delete(
+        &mut self,
+        parent_meta: &TableMetadata,
+        records: &[Record],
+    ) -> DatabaseResult<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let referencing_checks = self.build_referencing_fk_checks(parent_meta)?;
+        if referencing_checks.is_empty() {
+            return Ok(());
+        }
+
+        let db_name = self
+            .current_db
+            .clone()
+            .ok_or(DatabaseError::NoDatabaseSelected)?;
+        let db_path = self.data_dir.join(&db_name);
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        for record in records {
+            for fk in &referencing_checks {
+                let mut values = Vec::with_capacity(fk.parent_column_indices.len());
+                let mut has_null = false;
+                for col_idx in &fk.parent_column_indices {
+                    let value = record.get(*col_idx).unwrap();
+                    if value.is_null() {
+                        has_null = true;
+                        break;
+                    }
+                    values.push(value.clone());
+                }
+
+                if has_null {
+                    continue;
+                }
+
+                if fk.child_column_indices.len() == 1 && fk.parent_column_indices.len() == 1 {
+                    let fk_value = match values[0] {
+                        RecordValue::Int(v) => v as i64,
+                        _ => {
+                            return Err(DatabaseError::TypeMismatch(
+                                "Foreign key column must be INT".to_string(),
+                            ))
+                        }
+                    };
+
+                    let mut used_index = false;
+                    let mut index_found = false;
+                    match self.index_manager.open_index(
+                        &db_path_str,
+                        &fk.child_table,
+                        &fk.child_column_names[0],
+                    ) {
+                        Ok(()) => {
+                            used_index = true;
+                            index_found = self
+                                .index_manager
+                                .search(&fk.child_table, &fk.child_column_names[0], fk_value)
+                                .is_some();
+                        }
+                        Err(IndexError::IndexNotFound(_)) => {}
+                        Err(err) => return Err(DatabaseError::IndexError(err)),
+                    };
+
+                    if used_index && index_found {
+                        return Err(self.foreign_key_delete_error(fk, &values));
+                    }
+                }
+
+                let table_path = self.table_path(&db_name, &fk.child_table);
+                let _ = self
+                    .record_manager
+                    .open_table(&table_path.to_string_lossy(), fk.child_schema.clone());
+                let scan_iter = self.record_manager.scan_iter(&fk.child_table)?;
+                let mut found = false;
+                for item in scan_iter {
+                    let (_rid, child_record) = item?;
+                    let mut matches = true;
+                    for (idx, value) in fk.child_column_indices.iter().zip(values.iter()) {
+                        let child_value = child_record.get(*idx).unwrap();
+                        if child_value.is_null() || child_value != value {
+                            matches = false;
+                            break;
+                        }
+                    }
+                    if matches {
+                        found = true;
+                        break;
+                    }
+                }
+
+                if found {
+                    return Err(self.foreign_key_delete_error(fk, &values));
+                }
             }
         }
 

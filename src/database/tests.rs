@@ -1055,3 +1055,72 @@ fn test_foreign_key_add_constraint_validation() {
         ))
         .unwrap();
 }
+
+#[test]
+fn test_foreign_key_delete_restriction() {
+    let (_temp, mut db_manager) = setup_test_db();
+
+    db_manager.create_database("testdb").unwrap();
+    db_manager.use_database("testdb").unwrap();
+
+    let parent_fields = vec![
+        CreateTableField::Col("id".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Pkey(Box::new(AlterStatement::AddPKey(
+            "parent".to_string(),
+            vec!["id".to_string()],
+        ))),
+    ];
+    db_manager.create_table("parent", parent_fields).unwrap();
+    db_manager
+        .execute_alter_statement(AlterStatement::AddIndex(
+            "parent".to_string(),
+            None,
+            vec!["id".to_string()],
+        ))
+        .unwrap();
+
+    let child_fields = vec![
+        CreateTableField::Col("id".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Col(
+            "parent_id".to_string(),
+            ColumnType::Int,
+            false,
+            ParserValue::Null,
+        ),
+        CreateTableField::Fkey(Box::new(AlterStatement::AddFKey(
+            "child".to_string(),
+            Some("fk_parent".to_string()),
+            vec!["parent_id".to_string()],
+            "parent".to_string(),
+            vec!["id".to_string()],
+        ))),
+    ];
+    db_manager.create_table("child", child_fields).unwrap();
+
+    db_manager
+        .insert("parent", vec![vec![ParserValue::Integer(1)]])
+        .unwrap();
+    db_manager
+        .insert(
+            "child",
+            vec![vec![ParserValue::Integer(1), ParserValue::Integer(1)]],
+        )
+        .unwrap();
+
+    let delete_parent = db_manager.delete("parent", None);
+    assert!(matches!(
+        delete_parent,
+        Err(DatabaseError::ForeignKeyViolation(_))
+    ));
+
+    let where_child = vec![WhereClause::Op(
+        TableColumn {
+            table: None,
+            column: "id".to_string(),
+        },
+        Operator::Eq,
+        Expression::Value(ParserValue::Integer(1)),
+    )];
+    db_manager.delete("child", Some(where_child)).unwrap();
+    db_manager.delete("parent", None).unwrap();
+}

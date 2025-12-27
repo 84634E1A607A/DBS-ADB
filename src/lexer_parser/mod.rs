@@ -120,6 +120,7 @@ mod tests {
             ALTER TABLE my_table DROP FOREIGN KEY fk_my_table;
             ALTER TABLE my_table ADD PRIMARY KEY (col1, col2);
             ALTER TABLE my_table ADD FOREIGN KEY fk_my_fkey (col1, col2, col3) REFERENCES ref_table (ref_col1, ref_col2, ref_col3);
+            ALTER TABLE my_table ADD CONSTRAINT fk_named FOREIGN KEY (col4) REFERENCES ref_table (ref_col4);
             ";
 
         let result = parse(query);
@@ -157,6 +158,13 @@ mod tests {
                     vec!["col1".into(), "col2".into(), "col3".into()],
                     "ref_table".into(),
                     vec!["ref_col1".into(), "ref_col2".into(), "ref_col3".into()]
+                )),
+                Query::AlterStmt(AlterStatement::AddFKey(
+                    "my_table".into(),
+                    Some("fk_named".into()),
+                    vec!["col4".into()],
+                    "ref_table".into(),
+                    vec!["ref_col4".into()]
                 )),
             ]
         );

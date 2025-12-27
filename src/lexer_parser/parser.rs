@@ -299,14 +299,16 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
             });
 
         let add_fkey = alter_table
-            // ADD FOREIGN KEY Identifier?
+            // ADD (CONSTRAINT Identifier)? FOREIGN KEY Identifier?
             .then(
-                just([
-                    T::Keyword(K::Add),
-                    T::Keyword(K::Foreign),
-                    T::Keyword(K::Key),
-                ])
-                .ignore_then(identifier().or_not()),
+                just(T::Keyword(K::Add))
+                    .ignore_then(
+                        just(T::Keyword(K::Constraint))
+                            .ignore_then(identifier())
+                            .or_not(),
+                    )
+                    .then_ignore(just([T::Keyword(K::Foreign), T::Keyword(K::Key)]))
+                    .then(identifier().or_not()),
             )
             // ( field_list )
             .then(
@@ -327,8 +329,8 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
                     .boxed(),
             )
             .validate(
-                |((((table_ident, fkey_name), fields), ref_table), ref_fields): (
-                    (((&str, Option<&str>), Vec<&str>), &str),
+                |((((table_ident, (constraint_name, fkey_name)), fields), ref_table), ref_fields): (
+                    (((&str, (Option<&str>, Option<&str>)), Vec<&str>), &str),
                     Vec<&str>,
                 ),
                  _map,
@@ -348,7 +350,9 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
 
                     AlterStatement::AddFKey(
                         table_ident.into(),
-                        fkey_name.map(|s| s.into()),
+                        constraint_name
+                            .or(fkey_name)
+                            .map(|s| s.into()),
                         fields.into_iter().map(|s| s.into()).collect(),
                         ref_table.into(),
                         ref_fields.into_iter().map(|s| s.into()).collect(),
