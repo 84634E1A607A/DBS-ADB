@@ -67,8 +67,6 @@ impl PersistentBPlusTree {
         let metadata_bytes = buffer_mgr.get_page(file_handle, 0)?;
         let metadata = deserialize_metadata(metadata_bytes)?;
 
-        // Reconstruct the tree from disk
-        let tree = BPlusTree::new(metadata.order)?;
         let mut nodes = Vec::new();
 
         // We need to load all nodes from disk
@@ -80,22 +78,20 @@ impl PersistentBPlusTree {
             Self::load_tree_nodes(buffer_mgr, file_handle, root_id, &mut nodes)?;
         }
 
-        // Set the tree's internal state
-        // Note: This requires access to private fields of BPlusTree
-        // We'll need to add a method to BPlusTree to set its state
-        // For now, we'll rebuild by inserting all entries
+        let tree = BPlusTree::from_persistent_state(
+            metadata.order,
+            metadata.root_node_id,
+            metadata.first_leaf_id,
+            metadata.entry_count,
+            nodes,
+        )?;
 
-        let mut persistent_tree = Self {
+        Ok(Self {
             tree,
             file_handle,
             dirty_pages: HashSet::new(),
             metadata_dirty: false,
-        };
-
-        // Store loaded nodes into tree's node storage
-        persistent_tree.tree = Self::reconstruct_tree(metadata, nodes)?;
-
-        Ok(persistent_tree)
+        })
     }
 
     /// Load all tree nodes recursively from disk
@@ -129,44 +125,7 @@ impl PersistentBPlusTree {
         Ok(())
     }
 
-    /// Reconstruct B+ tree from loaded nodes
-    fn reconstruct_tree(
-        metadata: BPlusTreeMetadata,
-        nodes: Vec<Option<BPlusNode>>,
-    ) -> IndexResult<BPlusTree> {
-        // Create a new tree with the correct order
-        let mut tree = BPlusTree::new(metadata.order)?;
-
-        // We need to insert all entries from the leaf nodes
-        // Collect all entries by scanning leaf nodes
-        let mut entries = Vec::new();
-
-        if let Some(first_leaf_id) = metadata.first_leaf_id {
-            let mut current_leaf_id = Some(first_leaf_id);
-
-            while let Some(leaf_id) = current_leaf_id {
-                if leaf_id >= nodes.len() {
-                    break;
-                }
-
-                if let Some(BPlusNode::Leaf(ref leaf)) = nodes[leaf_id] {
-                    for i in 0..leaf.len() {
-                        entries.push((leaf.keys[i], leaf.values[i]));
-                    }
-                    current_leaf_id = leaf.next;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // Insert all entries into the new tree
-        for (key, value) in entries {
-            tree.insert(key, value)?;
-        }
-
-        Ok(tree)
-    }
+    // Reconstructing via re-insertion is avoided to reduce memory overhead.
 
     /// Flush all dirty pages to disk
     pub fn flush(&mut self, buffer_mgr: &mut BufferManager) -> IndexResult<()> {

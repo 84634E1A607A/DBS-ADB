@@ -84,6 +84,34 @@ impl BPlusTree {
         Self::new(DEFAULT_ORDER).expect("Default order is valid")
     }
 
+    pub(crate) fn from_persistent_state(
+        order: usize,
+        root: Option<NodeId>,
+        first_leaf: Option<NodeId>,
+        entry_count: usize,
+        nodes: Vec<Option<BPlusNode>>,
+    ) -> BPlusTreeResult<Self> {
+        if order < 3 {
+            return Err(BPlusTreeError::InvalidOrder(order));
+        }
+
+        let mut free_list = Vec::new();
+        for (idx, node) in nodes.iter().enumerate() {
+            if node.is_none() {
+                free_list.push(idx);
+            }
+        }
+
+        Ok(Self {
+            root,
+            order,
+            nodes,
+            free_list,
+            first_leaf,
+            entry_count,
+        })
+    }
+
     /// Get the tree order
     pub fn order(&self) -> usize {
         self.order
