@@ -10,7 +10,7 @@ use crate::catalog::{
     TableMetadata,
 };
 use crate::file::{BufferManager, PagedFileManager};
-use crate::index::IndexManager;
+use crate::index::{IndexError, IndexManager};
 use crate::lexer_parser::{
     AlterStatement, CreateTableField, DBStatement, Expression, Operator, SelectClause, Selector,
     Selectors, TableColumn, TableStatement, Value as ParserValue, WhereClause,
@@ -64,8 +64,8 @@ pub enum DatabaseError {
     #[error("primary")]
     PrimaryKeyError,
 
-    #[error("Foreign key violation")]
-    ForeignKeyViolation,
+    #[error("Foreign key violation: {0}")]
+    ForeignKeyViolation(String),
 
     #[error("Not null constraint violation for column {0}")]
     NotNullViolation(String),
@@ -113,6 +113,16 @@ impl Iterator for TableIntColumnIter {
             }
         }
     }
+}
+
+struct ForeignKeyCheck {
+    table_name: String,
+    column_names: Vec<String>,
+    column_indices: Vec<usize>,
+    ref_table: String,
+    ref_column_names: Vec<String>,
+    ref_column_indices: Vec<usize>,
+    ref_schema: TableSchema,
 }
 
 #[derive(Clone, Copy)]
@@ -489,6 +499,8 @@ impl DatabaseManager {
             }
         }
 
+        self.validate_foreign_keys_for_records(&table_meta, &records)?;
+
         // Insert all records in one batch - much faster as it holds the lock only once
         let _record_ids = self.record_manager.bulk_insert(table, records)?;
         Ok(_record_ids.len())
@@ -540,7 +552,7 @@ impl DatabaseManager {
         updates: Vec<(String, ParserValue)>,
         where_clauses: Option<Vec<WhereClause>>,
     ) -> DatabaseResult<usize> {
-        let (_table_meta, schema) = {
+        let (table_meta, schema) = {
             let metadata = self
                 .current_metadata
                 .as_ref()
@@ -573,6 +585,15 @@ impl DatabaseManager {
             update_map.insert(col_idx, value);
         }
 
+        let fk_checks = self.build_foreign_key_checks(&table_meta)?;
+        let update_indices: HashSet<usize> = update_map.keys().copied().collect();
+        let should_check_fk = !fk_checks.is_empty()
+            && fk_checks.iter().any(|fk| {
+                fk.column_indices
+                    .iter()
+                    .any(|idx| update_indices.contains(idx))
+            });
+
         let mut updated = 0;
         let scan_iter = self.record_manager.scan_iter(table)?;
         for item in scan_iter {
@@ -588,6 +609,19 @@ impl DatabaseManager {
                     let data_type = &schema.columns[*col_idx].data_type;
                     let record_value = self.parser_value_to_record_value(new_value, data_type);
                     record.set(*col_idx, record_value);
+                }
+
+                if should_check_fk {
+                    let db_name = self
+                        .current_db
+                        .clone()
+                        .ok_or(DatabaseError::NoDatabaseSelected)?;
+                    self.validate_foreign_keys_for_record(
+                        &db_name,
+                        &fk_checks,
+                        &record,
+                        Some(&update_indices),
+                    )?;
                 }
 
                 self.record_manager.update(table, rid, record)?;
@@ -1023,6 +1057,234 @@ impl DatabaseManager {
             let db_path = self.data_dir.join(db_name);
             metadata.save(&db_path)?;
         }
+        Ok(())
+    }
+
+    fn build_foreign_key_check(
+        &self,
+        table_meta: &TableMetadata,
+        fk: &ForeignKeyMetadata,
+    ) -> DatabaseResult<ForeignKeyCheck> {
+        if fk.columns.len() != fk.ref_columns.len() {
+            return Err(DatabaseError::TypeMismatch(
+                "Foreign key column count mismatch".to_string(),
+            ));
+        }
+
+        let metadata = self
+            .current_metadata
+            .as_ref()
+            .ok_or(DatabaseError::NoDatabaseSelected)?;
+
+        let mut column_indices = Vec::with_capacity(fk.columns.len());
+        for col_name in &fk.columns {
+            let idx = table_meta
+                .columns
+                .iter()
+                .position(|c| &c.name == col_name)
+                .ok_or_else(|| {
+                    DatabaseError::ColumnNotFound(col_name.clone(), table_meta.name.clone())
+                })?;
+            column_indices.push(idx);
+        }
+
+        let ref_table_meta = metadata.get_table(&fk.ref_table)?.clone();
+        let mut ref_column_indices = Vec::with_capacity(fk.ref_columns.len());
+        for col_name in &fk.ref_columns {
+            let idx = ref_table_meta
+                .columns
+                .iter()
+                .position(|c| &c.name == col_name)
+                .ok_or_else(|| {
+                    DatabaseError::ColumnNotFound(col_name.clone(), fk.ref_table.clone())
+                })?;
+            ref_column_indices.push(idx);
+        }
+
+        for (pos, (col_idx, ref_idx)) in column_indices
+            .iter()
+            .zip(ref_column_indices.iter())
+            .enumerate()
+        {
+            let col_type = table_meta.columns[*col_idx].to_data_type();
+            let ref_type = ref_table_meta.columns[*ref_idx].to_data_type();
+            if col_type != ref_type {
+                return Err(DatabaseError::TypeMismatch(format!(
+                    "Foreign key column type mismatch: {}.{} vs {}.{}",
+                    table_meta.name,
+                    fk.columns[pos],
+                    fk.ref_table,
+                    fk.ref_columns[pos]
+                )));
+            }
+        }
+
+        Ok(ForeignKeyCheck {
+            table_name: table_meta.name.clone(),
+            column_names: fk.columns.clone(),
+            column_indices,
+            ref_table: fk.ref_table.clone(),
+            ref_column_names: fk.ref_columns.clone(),
+            ref_column_indices,
+            ref_schema: self.metadata_to_schema(&ref_table_meta),
+        })
+    }
+
+    fn build_foreign_key_checks(
+        &self,
+        table_meta: &TableMetadata,
+    ) -> DatabaseResult<Vec<ForeignKeyCheck>> {
+        if table_meta.foreign_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut checks = Vec::with_capacity(table_meta.foreign_keys.len());
+        for fk in &table_meta.foreign_keys {
+            checks.push(self.build_foreign_key_check(table_meta, fk)?);
+        }
+        Ok(checks)
+    }
+
+    fn foreign_key_error(&self, fk: &ForeignKeyCheck, values: &[RecordValue]) -> DatabaseError {
+        let value_desc = values
+            .iter()
+            .map(|value| format!("{:?}", value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        DatabaseError::ForeignKeyViolation(format!(
+            "{}({}) references {}({}): value {} not found",
+            fk.table_name,
+            fk.column_names.join(", "),
+            fk.ref_table,
+            fk.ref_column_names.join(", "),
+            value_desc
+        ))
+    }
+
+    fn validate_foreign_keys_for_records(
+        &mut self,
+        table_meta: &TableMetadata,
+        records: &[Record],
+    ) -> DatabaseResult<()> {
+        if table_meta.foreign_keys.is_empty() || records.is_empty() {
+            return Ok(());
+        }
+
+        let fk_checks = self.build_foreign_key_checks(table_meta)?;
+        if fk_checks.is_empty() {
+            return Ok(());
+        }
+
+        let db_name = self
+            .current_db
+            .clone()
+            .ok_or(DatabaseError::NoDatabaseSelected)?;
+        for record in records {
+            self.validate_foreign_keys_for_record(&db_name, &fk_checks, record, None)?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_foreign_keys_for_record(
+        &mut self,
+        db_name: &str,
+        fk_checks: &[ForeignKeyCheck],
+        record: &Record,
+        update_indices: Option<&HashSet<usize>>,
+    ) -> DatabaseResult<()> {
+        if fk_checks.is_empty() {
+            return Ok(());
+        }
+
+        let db_path = self.data_dir.join(db_name);
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        for fk in fk_checks {
+            if let Some(indices) = update_indices {
+                if !fk
+                    .column_indices
+                    .iter()
+                    .any(|idx| indices.contains(idx))
+                {
+                    continue;
+                }
+            }
+
+            let mut values = Vec::with_capacity(fk.column_indices.len());
+            let mut has_null = false;
+            for col_idx in &fk.column_indices {
+                let value = record.get(*col_idx).unwrap();
+                if value.is_null() {
+                    has_null = true;
+                    break;
+                }
+                values.push(value.clone());
+            }
+
+            if has_null {
+                continue;
+            }
+
+            if fk.column_indices.len() == 1 && fk.ref_column_indices.len() == 1 {
+                let fk_value = match values[0] {
+                    RecordValue::Int(v) => v as i64,
+                    _ => {
+                        return Err(DatabaseError::TypeMismatch(
+                            "Foreign key column must be INT".to_string(),
+                        ))
+                    }
+                };
+
+                let mut used_index = false;
+                let mut index_found = false;
+                match self.index_manager.open_index(
+                    &db_path_str,
+                    &fk.ref_table,
+                    &fk.ref_column_names[0],
+                ) {
+                    Ok(()) => {
+                        used_index = true;
+                        index_found = self
+                            .index_manager
+                            .search(&fk.ref_table, &fk.ref_column_names[0], fk_value)
+                            .is_some();
+                    }
+                    Err(IndexError::IndexNotFound(_)) => {}
+                    Err(err) => return Err(DatabaseError::IndexError(err)),
+                };
+
+                if used_index && index_found {
+                    continue;
+                }
+            }
+
+            let table_path = self.table_path(db_name, &fk.ref_table);
+            let _ = self
+                .record_manager
+                .open_table(&table_path.to_string_lossy(), fk.ref_schema.clone());
+            let scan_iter = self.record_manager.scan_iter(&fk.ref_table)?;
+            let mut found = false;
+            for item in scan_iter {
+                let (_rid, ref_record) = item?;
+                let mut matches = true;
+                for (idx, value) in fk.ref_column_indices.iter().zip(values.iter()) {
+                    if ref_record.get(*idx).unwrap() != value {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                return Err(self.foreign_key_error(fk, &values));
+            }
+        }
+
         Ok(())
     }
 
@@ -1626,7 +1888,92 @@ impl DatabaseManager {
                 self.save_current_metadata()?;
                 Ok(QueryResult::Empty)
             }
-            _ => Ok(QueryResult::Empty),
+            AlterStatement::AddFKey(table_name, fk_name, fk_cols, ref_table, ref_cols) => {
+                if fk_cols.len() != ref_cols.len() {
+                    return Err(DatabaseError::TypeMismatch(
+                        "Foreign key column count mismatch".to_string(),
+                    ));
+                }
+
+                let fk_name = fk_name.unwrap_or_else(|| format!("fk_{}", table_name));
+                let fk_meta = ForeignKeyMetadata {
+                    name: fk_name.clone(),
+                    columns: fk_cols.clone(),
+                    ref_table: ref_table.clone(),
+                    ref_columns: ref_cols.clone(),
+                };
+
+                let (table_meta, schema) = {
+                    let metadata = self
+                        .current_metadata
+                        .as_ref()
+                        .ok_or(DatabaseError::NoDatabaseSelected)?;
+                    let table_meta = metadata.get_table(&table_name)?.clone();
+
+                    if table_meta
+                        .foreign_keys
+                        .iter()
+                        .any(|fk| fk.name == fk_name)
+                    {
+                        return Err(DatabaseError::TypeMismatch(format!(
+                            "Foreign key {} already exists",
+                            fk_name
+                        )));
+                    }
+
+                    let schema = self.metadata_to_schema(&table_meta);
+                    (table_meta, schema)
+                };
+
+                let fk_check = self.build_foreign_key_check(&table_meta, &fk_meta)?;
+                let db_name = self
+                    .current_db
+                    .clone()
+                    .ok_or(DatabaseError::NoDatabaseSelected)?;
+                let table_path = self.table_path(&db_name, &table_name);
+                let _ = self
+                    .record_manager
+                    .open_table(&table_path.to_string_lossy(), schema);
+
+                let scan_iter = self.record_manager.scan_iter(&table_name)?;
+                for item in scan_iter {
+                    let (_rid, record) = item?;
+                    self.validate_foreign_keys_for_record(
+                        &db_name,
+                        std::slice::from_ref(&fk_check),
+                        &record,
+                        None,
+                    )?;
+                }
+
+                let metadata = self.current_metadata.as_mut().unwrap();
+                let table_meta_mut = metadata.get_table_mut(&table_name)?;
+                table_meta_mut.foreign_keys.push(fk_meta);
+                self.save_current_metadata()?;
+
+                Ok(QueryResult::Empty)
+            }
+            AlterStatement::DropFKey(table_name, fk_name) => {
+                let metadata = self
+                    .current_metadata
+                    .as_mut()
+                    .ok_or(DatabaseError::NoDatabaseSelected)?;
+                let table_meta = metadata.get_table_mut(&table_name)?;
+
+                let pos = table_meta
+                    .foreign_keys
+                    .iter()
+                    .position(|fk| fk.name == fk_name)
+                    .ok_or_else(|| {
+                        DatabaseError::TypeMismatch(format!(
+                            "Foreign key {} not found",
+                            fk_name
+                        ))
+                    })?;
+                table_meta.foreign_keys.remove(pos);
+                self.save_current_metadata()?;
+                Ok(QueryResult::Empty)
+            }
         }
     }
 }

@@ -194,6 +194,7 @@ fn run_interactive_mode(db_manager: &mut DatabaseManager, batch_mode: bool) {
                         // Map long error messages to shorter ones for batch mode
                         match e {
                             DatabaseError::PrimaryKeyViolation => println!("duplicate"),
+                            DatabaseError::ForeignKeyViolation(_) => println!("foreign"),
                             _ => println!("{}", e),
                         }
                     } else {

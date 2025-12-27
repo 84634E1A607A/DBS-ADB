@@ -898,3 +898,160 @@ fn test_persistence() {
         assert_eq!(rows[0][0], "42");
     }
 }
+
+#[test]
+fn test_foreign_key_insert_update_validation() {
+    let (_temp, mut db_manager) = setup_test_db();
+
+    db_manager.create_database("testdb").unwrap();
+    db_manager.use_database("testdb").unwrap();
+
+    let parent_fields = vec![
+        CreateTableField::Col("id".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Pkey(Box::new(AlterStatement::AddPKey(
+            "parent".to_string(),
+            vec!["id".to_string()],
+        ))),
+    ];
+    db_manager.create_table("parent", parent_fields).unwrap();
+    db_manager
+        .execute_alter_statement(AlterStatement::AddIndex(
+            "parent".to_string(),
+            None,
+            vec!["id".to_string()],
+        ))
+        .unwrap();
+
+    let child_fields = vec![
+        CreateTableField::Col("id".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Col(
+            "parent_id".to_string(),
+            ColumnType::Int,
+            false,
+            ParserValue::Null,
+        ),
+        CreateTableField::Fkey(Box::new(AlterStatement::AddFKey(
+            "child".to_string(),
+            Some("fk_parent".to_string()),
+            vec!["parent_id".to_string()],
+            "parent".to_string(),
+            vec!["id".to_string()],
+        ))),
+    ];
+    db_manager.create_table("child", child_fields).unwrap();
+
+    db_manager
+        .insert("parent", vec![vec![ParserValue::Integer(1)]])
+        .unwrap();
+    db_manager
+        .insert(
+            "child",
+            vec![vec![ParserValue::Integer(1), ParserValue::Integer(1)]],
+        )
+        .unwrap();
+    db_manager
+        .insert(
+            "child",
+            vec![vec![ParserValue::Integer(2), ParserValue::Null]],
+        )
+        .unwrap();
+
+    let bad_insert = db_manager.insert(
+        "child",
+        vec![vec![ParserValue::Integer(3), ParserValue::Integer(99)]],
+    );
+    assert!(matches!(
+        bad_insert,
+        Err(DatabaseError::ForeignKeyViolation(_))
+    ));
+
+    let updates = vec![("parent_id".to_string(), ParserValue::Integer(100))];
+    let bad_update = db_manager.update("child", updates, None);
+    assert!(matches!(
+        bad_update,
+        Err(DatabaseError::ForeignKeyViolation(_))
+    ));
+}
+
+#[test]
+fn test_foreign_key_add_constraint_validation() {
+    let (_temp, mut db_manager) = setup_test_db();
+
+    db_manager.create_database("testdb").unwrap();
+    db_manager.use_database("testdb").unwrap();
+
+    let parent_fields = vec![
+        CreateTableField::Col("id".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Pkey(Box::new(AlterStatement::AddPKey(
+            "parent".to_string(),
+            vec!["id".to_string()],
+        ))),
+    ];
+    db_manager.create_table("parent", parent_fields).unwrap();
+    db_manager
+        .execute_alter_statement(AlterStatement::AddIndex(
+            "parent".to_string(),
+            None,
+            vec!["id".to_string()],
+        ))
+        .unwrap();
+
+    let child_fields = vec![
+        CreateTableField::Col("id".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Col(
+            "parent_id".to_string(),
+            ColumnType::Int,
+            false,
+            ParserValue::Null,
+        ),
+    ];
+    db_manager.create_table("child", child_fields).unwrap();
+
+    db_manager
+        .insert("parent", vec![vec![ParserValue::Integer(1)]])
+        .unwrap();
+    db_manager
+        .insert(
+            "child",
+            vec![vec![ParserValue::Integer(1), ParserValue::Integer(1)]],
+        )
+        .unwrap();
+    db_manager
+        .insert(
+            "child",
+            vec![vec![ParserValue::Integer(2), ParserValue::Integer(99)]],
+        )
+        .unwrap();
+
+    let add_fk = db_manager.execute_alter_statement(AlterStatement::AddFKey(
+        "child".to_string(),
+        Some("fk_parent".to_string()),
+        vec!["parent_id".to_string()],
+        "parent".to_string(),
+        vec!["id".to_string()],
+    ));
+    assert!(matches!(
+        add_fk,
+        Err(DatabaseError::ForeignKeyViolation(_))
+    ));
+
+    let where_clauses = vec![WhereClause::Op(
+        TableColumn {
+            table: None,
+            column: "parent_id".to_string(),
+        },
+        Operator::Eq,
+        Expression::Value(ParserValue::Integer(99)),
+    )];
+    db_manager.delete("child", Some(where_clauses)).unwrap();
+
+    db_manager
+        .execute_alter_statement(AlterStatement::AddFKey(
+            "child".to_string(),
+            Some("fk_parent".to_string()),
+            vec!["parent_id".to_string()],
+            "parent".to_string(),
+            vec!["id".to_string()],
+        ))
+        .unwrap();
+}
