@@ -289,6 +289,10 @@ impl DatabaseManager {
         let metadata = DatabaseMetadata::load(&db_path)?;
         self.current_db = Some(name.to_string());
         self.current_metadata = Some(metadata);
+        let updated = self.ensure_foreign_key_indexes()?;
+        if updated {
+            self.save_current_metadata()?;
+        }
 
         Ok(())
     }
@@ -359,8 +363,8 @@ impl DatabaseManager {
         };
 
         // Create the table file
-        let db_name = self.current_db.as_ref().unwrap();
-        let table_path = self.table_path(db_name, name);
+        let db_name = self.current_db.as_ref().unwrap().clone();
+        let table_path = self.table_path(&db_name, name);
         let schema = self.metadata_to_schema(&table_metadata);
         self.record_manager
             .create_table(&table_path.to_string_lossy(), schema)?;
@@ -368,6 +372,7 @@ impl DatabaseManager {
         // Add to metadata
         let metadata = self.current_metadata.as_mut().unwrap();
         metadata.add_table(table_metadata);
+        let _ = self.ensure_foreign_key_indexes()?;
         self.save_current_metadata()?;
 
         Ok(())
@@ -1466,10 +1471,10 @@ impl DatabaseManager {
                 let value = record.get(*col_idx).ok_or_else(|| {
                     DatabaseError::TypeMismatch("Invalid COUNT column".to_string())
                 })?;
-                if !matches!(value, RecordValue::Null) {
-                    if let AggState::Count(count) = state {
-                        *count += 1;
-                    }
+                if !matches!(value, RecordValue::Null)
+                    && let AggState::Count(count) = state
+                {
+                    *count += 1;
                 }
             }
             AggSpec::Sum { col_idx, numeric } => {
@@ -1796,7 +1801,6 @@ impl DatabaseManager {
 
         let num_columns = table_meta.columns.len();
         const BATCH_SIZE: usize = 50000; // Larger batches reduce overhead from allocating/deallocating vectors
-        const PROGRESS_INTERVAL: usize = 50_000; // Report progress every 100k lines
 
         let mut total_inserted = 0;
         let mut batch_rows = Vec::with_capacity(BATCH_SIZE);
@@ -1931,6 +1935,158 @@ impl DatabaseManager {
             metadata.save(&db_path)?;
         }
         Ok(())
+    }
+
+    fn implicit_fk_index_name(&self, table: &str, column: &str) -> String {
+        format!("__fk_idx_{}_{}", table, column)
+    }
+
+    fn ensure_foreign_key_indexes(&mut self) -> DatabaseResult<bool> {
+        let db_name = self
+            .current_db
+            .as_ref()
+            .ok_or(DatabaseError::NoDatabaseSelected)?
+            .clone();
+        let metadata = self
+            .current_metadata
+            .as_ref()
+            .ok_or(DatabaseError::NoDatabaseSelected)?;
+
+        let mut required: HashMap<String, HashSet<String>> = HashMap::new();
+        for (table_name, table_meta) in &metadata.tables {
+            for fk in &table_meta.foreign_keys {
+                if fk.columns.len() == 1 {
+                    required
+                        .entry(table_name.clone())
+                        .or_default()
+                        .insert(fk.columns[0].clone());
+                }
+                if fk.ref_columns.len() == 1 {
+                    required
+                        .entry(fk.ref_table.clone())
+                        .or_default()
+                        .insert(fk.ref_columns[0].clone());
+                }
+            }
+        }
+        let _ = metadata;
+
+        let table_names: Vec<String> = {
+            let metadata = self
+                .current_metadata
+                .as_ref()
+                .ok_or(DatabaseError::NoDatabaseSelected)?;
+            metadata.tables.keys().cloned().collect()
+        };
+
+        let mut updated = false;
+        for table_name in table_names {
+            let mut table_meta = {
+                let metadata = self
+                    .current_metadata
+                    .as_mut()
+                    .ok_or(DatabaseError::NoDatabaseSelected)?;
+                metadata
+                    .tables
+                    .remove(&table_name)
+                    .ok_or_else(|| DatabaseError::TableNotFound(table_name.clone()))?
+            };
+
+            let required_cols = required.get(&table_name).cloned().unwrap_or_default();
+            let mut columns_to_drop = Vec::new();
+            table_meta.indexes.retain(|idx| {
+                if idx.implicit
+                    && idx.columns.len() == 1
+                    && !required_cols.contains(&idx.columns[0])
+                {
+                    columns_to_drop.push(idx.columns[0].clone());
+                    updated = true;
+                    false
+                } else {
+                    true
+                }
+            });
+
+            let mut to_create = Vec::new();
+            for col_name in &required_cols {
+                if table_meta
+                    .indexes
+                    .iter()
+                    .any(|idx| idx.columns.len() == 1 && idx.columns[0] == *col_name)
+                {
+                    continue;
+                }
+                let col_idx = table_meta
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == col_name)
+                    .ok_or_else(|| {
+                        DatabaseError::ColumnNotFound(col_name.clone(), table_meta.name.clone())
+                    })?;
+                if table_meta.columns[col_idx].to_data_type() != DataType::Int {
+                    continue;
+                }
+                to_create.push((col_name.clone(), col_idx));
+            }
+
+            let db_path = self.data_dir.join(&db_name);
+            let db_path_str = db_path.to_string_lossy().to_string();
+            let schema = self.metadata_to_schema(&table_meta);
+
+            if !to_create.is_empty() {
+                let table_path = self.table_path(&db_name, &table_meta.name);
+                self.record_manager
+                    .open_table(&table_path.to_string_lossy(), schema)?;
+            }
+
+            for (col_name, col_idx) in to_create {
+                match self
+                    .index_manager
+                    .open_index(&db_path_str, &table_meta.name, &col_name)
+                {
+                    Ok(()) => {}
+                    Err(IndexError::IndexNotFound(_)) => {
+                        let scan_iter = self.record_manager.scan_iter(&table_meta.name)?;
+                        let table_iter = TableIntColumnIter::new(scan_iter, col_idx);
+                        self.index_manager.create_index_from_table(
+                            &db_path_str,
+                            &table_meta.name,
+                            &col_name,
+                            table_iter,
+                        )?;
+                    }
+                    Err(err) => return Err(DatabaseError::IndexError(err)),
+                }
+
+                table_meta.indexes.push(IndexMetadata {
+                    name: self.implicit_fk_index_name(&table_meta.name, &col_name),
+                    columns: vec![col_name],
+                    implicit: true,
+                });
+                updated = true;
+            }
+
+            for column_name in columns_to_drop {
+                if let Err(err) =
+                    self.index_manager
+                        .drop_index(&db_path_str, &table_meta.name, &column_name)
+                {
+                    if !matches!(err, crate::index::IndexError::IndexNotFound(_)) {
+                        return Err(DatabaseError::IndexError(err));
+                    }
+                }
+            }
+
+            {
+                let metadata = self
+                    .current_metadata
+                    .as_mut()
+                    .ok_or(DatabaseError::NoDatabaseSelected)?;
+                metadata.tables.insert(table_name, table_meta);
+            }
+        }
+
+        Ok(updated)
     }
 
     fn build_foreign_key_check(
@@ -2092,10 +2248,10 @@ impl DatabaseManager {
         let db_path_str = db_path.to_string_lossy().to_string();
 
         for fk in fk_checks {
-            if let Some(indices) = update_indices {
-                if !fk.column_indices.iter().any(|idx| indices.contains(idx)) {
-                    continue;
-                }
+            if let Some(indices) = update_indices
+                && !fk.column_indices.iter().any(|idx| indices.contains(idx))
+            {
+                continue;
             }
 
             let mut values = Vec::with_capacity(fk.column_indices.len());
@@ -2417,13 +2573,13 @@ impl DatabaseManager {
         schema: &TableSchema,
         column: &TableColumn,
     ) -> DatabaseResult<usize> {
-        if let Some(table) = &column.table {
-            if table != &schema.table_name {
-                return Err(DatabaseError::ColumnNotFound(
-                    column.column.clone(),
-                    table.clone(),
-                ));
-            }
+        if let Some(table) = &column.table
+            && table != &schema.table_name
+        {
+            return Err(DatabaseError::ColumnNotFound(
+                column.column.clone(),
+                table.clone(),
+            ));
         }
 
         schema
@@ -2707,11 +2863,6 @@ impl DatabaseManager {
                         return Ok(false);
                     }
                 }
-                _ => {
-                    return Err(DatabaseError::TypeMismatch(
-                        "WHERE clause type not yet supported".to_string(),
-                    ));
-                }
             }
         }
 
@@ -2859,18 +3010,29 @@ impl DatabaseManager {
                 let column_name = columns[0].clone();
                 let index_name = index_name.unwrap_or_else(|| format!("idx_{}", column_name));
 
-                let (schema, col_idx) = {
+                let (schema, col_idx, reuse_implicit) = {
                     let metadata = self
                         .current_metadata
                         .as_ref()
                         .ok_or(DatabaseError::NoDatabaseSelected)?;
                     let table_meta = metadata.get_table(&table_name)?.clone();
 
-                    if table_meta
-                        .indexes
-                        .iter()
-                        .any(|idx| idx.name == index_name || idx.columns == columns)
-                    {
+                    let mut implicit_on_column = false;
+                    for idx in &table_meta.indexes {
+                        if idx.columns == columns {
+                            if idx.implicit {
+                                implicit_on_column = true;
+                            } else {
+                                return Err(DatabaseError::TypeMismatch(format!(
+                                    "Index {} already exists",
+                                    index_name
+                                )));
+                            }
+                        }
+                    }
+                    if table_meta.indexes.iter().any(|idx| {
+                        idx.name == index_name && !(idx.implicit && idx.columns == columns)
+                    }) {
                         return Err(DatabaseError::TypeMismatch(format!(
                             "Index {} already exists",
                             index_name
@@ -2892,7 +3054,7 @@ impl DatabaseManager {
                     }
 
                     let schema = self.metadata_to_schema(&table_meta);
-                    (schema, col_idx)
+                    (schema, col_idx, implicit_on_column)
                 };
 
                 let db_name = self
@@ -2902,9 +3064,53 @@ impl DatabaseManager {
                 let db_path = self.data_dir.join(db_name);
                 let db_path_str = db_path.to_string_lossy().to_string();
 
+                if reuse_implicit {
+                    match self
+                        .index_manager
+                        .open_index(&db_path_str, &table_name, &column_name)
+                    {
+                        Ok(()) => {}
+                        Err(IndexError::IndexNotFound(_)) => {
+                            let table_path = self.table_path(db_name, &table_name);
+                            self.record_manager.open_table(
+                                table_path.to_string_lossy().as_ref(),
+                                schema.clone(),
+                            )?;
+                            let scan_iter = self.record_manager.scan_iter(&table_name)?;
+                            let table_iter = TableIntColumnIter::new(scan_iter, col_idx);
+                            self.index_manager.create_index_from_table(
+                                &db_path_str,
+                                &table_name,
+                                &column_name,
+                                table_iter,
+                            )?;
+                        }
+                        Err(err) => return Err(DatabaseError::IndexError(err)),
+                    }
+
+                    let metadata = self.current_metadata.as_mut().unwrap();
+                    let table_meta_mut = metadata.get_table_mut(&table_name)?;
+                    if let Some(idx_meta) = table_meta_mut
+                        .indexes
+                        .iter_mut()
+                        .find(|idx| idx.columns == columns && idx.implicit)
+                    {
+                        idx_meta.name = index_name;
+                        idx_meta.implicit = false;
+                    } else {
+                        table_meta_mut.indexes.push(IndexMetadata {
+                            name: index_name,
+                            columns: columns.clone(),
+                            implicit: false,
+                        });
+                    }
+                    self.save_current_metadata()?;
+                    return Ok(QueryResult::Empty);
+                }
+
                 let table_path = self.table_path(db_name, &table_name);
                 self.record_manager
-                    .open_table(&table_path.to_string_lossy().to_string(), schema.clone())?;
+                    .open_table(table_path.to_string_lossy().as_ref(), schema.clone())?;
 
                 let scan_iter = self.record_manager.scan_iter(&table_name)?;
                 let table_iter = TableIntColumnIter::new(scan_iter, col_idx);
@@ -2920,6 +3126,7 @@ impl DatabaseManager {
                 table_meta_mut.indexes.push(IndexMetadata {
                     name: index_name,
                     columns,
+                    implicit: false,
                 });
                 self.save_current_metadata()?;
 
@@ -2930,42 +3137,53 @@ impl DatabaseManager {
                     .current_db
                     .as_ref()
                     .ok_or(DatabaseError::NoDatabaseSelected)?;
-                let db_path = self.data_dir.join(db_name);
+                let db_name = db_name.clone();
+                let db_path = self.data_dir.join(&db_name);
                 let db_path_str = db_path.to_string_lossy().to_string();
 
-                let column_name = {
+                let mut table_meta = {
                     let metadata = self
                         .current_metadata
                         .as_mut()
                         .ok_or(DatabaseError::NoDatabaseSelected)?;
-                    let table_meta = metadata.get_table_mut(&table_name)?;
-
-                    let pos = table_meta
-                        .indexes
-                        .iter()
-                        .position(|idx| idx.name == index_name)
-                        .ok_or_else(|| {
-                            DatabaseError::TypeMismatch(format!("Index {} not found", index_name))
-                        })?;
-
-                    let index_meta = table_meta.indexes.remove(pos);
-                    if index_meta.columns.len() != 1 {
-                        return Err(DatabaseError::TypeMismatch(
-                            "Only single-column indexes are supported".to_string(),
-                        ));
-                    }
-                    index_meta.columns[0].clone()
+                    metadata
+                        .tables
+                        .remove(&table_name)
+                        .ok_or_else(|| DatabaseError::TableNotFound(table_name.clone()))?
                 };
+
+                let pos = table_meta
+                    .indexes
+                    .iter()
+                    .position(|idx| idx.name == index_name)
+                    .ok_or_else(|| {
+                        DatabaseError::TypeMismatch(format!("Index {} not found", index_name))
+                    })?;
+
+                let index_meta = table_meta.indexes.remove(pos);
+                if index_meta.columns.len() != 1 {
+                    return Err(DatabaseError::TypeMismatch(
+                        "Only single-column indexes are supported".to_string(),
+                    ));
+                }
+                let column_name = index_meta.columns[0].clone();
 
                 if let Err(err) =
                     self.index_manager
                         .drop_index(&db_path_str, &table_name, &column_name)
+                    && !matches!(err, crate::index::IndexError::IndexNotFound(_))
                 {
-                    if !matches!(err, crate::index::IndexError::IndexNotFound(_)) {
-                        return Err(DatabaseError::IndexError(err));
-                    }
+                    return Err(DatabaseError::IndexError(err));
                 }
 
+                {
+                    let metadata = self
+                        .current_metadata
+                        .as_mut()
+                        .ok_or(DatabaseError::NoDatabaseSelected)?;
+                    metadata.tables.insert(table_name.clone(), table_meta);
+                }
+                let _ = self.ensure_foreign_key_indexes()?;
                 self.save_current_metadata()?;
                 Ok(QueryResult::Empty)
             }
@@ -3004,7 +3222,7 @@ impl DatabaseManager {
                 let table_path = self.table_path(db_name, &table_name);
                 let _ = self
                     .record_manager
-                    .open_table(&table_path.to_string_lossy().to_string(), schema);
+                    .open_table(table_path.to_string_lossy().as_ref(), schema);
 
                 let scan_iter = self.record_manager.scan_iter(&table_name)?;
                 let mut pk_set = HashSet::new();
@@ -3084,8 +3302,9 @@ impl DatabaseManager {
                 let fk_check = self.build_foreign_key_check(&table_meta, &fk_meta)?;
                 let db_name = self
                     .current_db
-                    .clone()
-                    .ok_or(DatabaseError::NoDatabaseSelected)?;
+                    .as_ref()
+                    .ok_or(DatabaseError::NoDatabaseSelected)?
+                    .clone();
                 let table_path = self.table_path(&db_name, &table_name);
                 let _ = self
                     .record_manager
@@ -3102,19 +3321,34 @@ impl DatabaseManager {
                     )?;
                 }
 
-                let metadata = self.current_metadata.as_mut().unwrap();
-                let table_meta_mut = metadata.get_table_mut(&table_name)?;
-                table_meta_mut.foreign_keys.push(fk_meta);
+                let mut table_meta = {
+                    let metadata = self.current_metadata.as_mut().unwrap();
+                    metadata
+                        .tables
+                        .remove(&table_name)
+                        .ok_or_else(|| DatabaseError::TableNotFound(table_name.clone()))?
+                };
+                table_meta.foreign_keys.push(fk_meta);
+                {
+                    let metadata = self.current_metadata.as_mut().unwrap();
+                    metadata.tables.insert(table_name.clone(), table_meta);
+                }
+                let _ = self.ensure_foreign_key_indexes()?;
                 self.save_current_metadata()?;
 
                 Ok(QueryResult::Empty)
             }
             AlterStatement::DropFKey(table_name, fk_name) => {
-                let metadata = self
-                    .current_metadata
-                    .as_mut()
-                    .ok_or(DatabaseError::NoDatabaseSelected)?;
-                let table_meta = metadata.get_table_mut(&table_name)?;
+                let mut table_meta = {
+                    let metadata = self
+                        .current_metadata
+                        .as_mut()
+                        .ok_or(DatabaseError::NoDatabaseSelected)?;
+                    metadata
+                        .tables
+                        .remove(&table_name)
+                        .ok_or_else(|| DatabaseError::TableNotFound(table_name.clone()))?
+                };
 
                 let pos = table_meta
                     .foreign_keys
@@ -3124,6 +3358,15 @@ impl DatabaseManager {
                         DatabaseError::TypeMismatch(format!("Foreign key {} not found", fk_name))
                     })?;
                 table_meta.foreign_keys.remove(pos);
+
+                {
+                    let metadata = self
+                        .current_metadata
+                        .as_mut()
+                        .ok_or(DatabaseError::NoDatabaseSelected)?;
+                    metadata.tables.insert(table_name.clone(), table_meta);
+                }
+                let _ = self.ensure_foreign_key_indexes()?;
                 self.save_current_metadata()?;
                 Ok(QueryResult::Empty)
             }

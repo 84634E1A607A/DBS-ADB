@@ -329,7 +329,10 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
                     .boxed(),
             )
             .validate(
-                |((((table_ident, (constraint_name, fkey_name)), fields), ref_table), ref_fields): (
+                |(
+                    (((table_ident, (constraint_name, fkey_name)), fields), ref_table),
+                    ref_fields,
+                ): (
                     (((&str, (Option<&str>, Option<&str>)), Vec<&str>), &str),
                     Vec<&str>,
                 ),
@@ -350,9 +353,7 @@ pub fn parser<'a>() -> impl Parser<'a, &'a [T<'a>], Vec<Query>, extra::Err<Rich<
 
                     AlterStatement::AddFKey(
                         table_ident.into(),
-                        constraint_name
-                            .or(fkey_name)
-                            .map(|s| s.into()),
+                        constraint_name.or(fkey_name).map(|s| s.into()),
                         fields.into_iter().map(|s| s.into()).collect(),
                         ref_table.into(),
                         ref_fields.into_iter().map(|s| s.into()).collect(),

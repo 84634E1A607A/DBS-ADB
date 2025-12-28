@@ -50,10 +50,11 @@ fn main() {
     // Handle --init: delete existing data and initialize
     if args.init {
         if Path::new(&args.data_dir).exists()
-            && let Err(e) = fs::remove_dir_all(&args.data_dir) {
-                eprintln!("Failed to remove existing data directory: {}", e);
-                std::process::exit(1);
-            }
+            && let Err(e) = fs::remove_dir_all(&args.data_dir)
+        {
+            eprintln!("Failed to remove existing data directory: {}", e);
+            std::process::exit(1);
+        }
 
         match DatabaseManager::new(&args.data_dir) {
             Ok(_) => {
@@ -280,6 +281,9 @@ fn print_result(result: &QueryResult) {
             }
 
             for idx in &meta.indexes {
+                if idx.implicit {
+                    continue;
+                }
                 // Index name is omitted in expected outputs
                 println!("INDEX ({});", idx.columns.join(", "));
             }

@@ -97,6 +97,8 @@ impl ColumnMetadata {
 pub struct IndexMetadata {
     pub name: String,
     pub columns: Vec<String>,
+    #[serde(default)]
+    pub implicit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

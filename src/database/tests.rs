@@ -774,10 +774,7 @@ fn test_select_order_by_offset_past_end() {
     db_manager
         .insert(
             "test",
-            vec![
-                vec![ParserValue::Integer(1)],
-                vec![ParserValue::Integer(2)],
-            ],
+            vec![vec![ParserValue::Integer(1)], vec![ParserValue::Integer(2)]],
         )
         .unwrap();
 
@@ -1169,8 +1166,18 @@ fn test_two_table_join_basic() {
     assert_eq!(
         rows,
         vec![
-            vec!["2".to_string(), "y".to_string(), "2".to_string(), "p".to_string()],
-            vec!["3".to_string(), "z".to_string(), "3".to_string(), "q".to_string()],
+            vec![
+                "2".to_string(),
+                "y".to_string(),
+                "2".to_string(),
+                "p".to_string()
+            ],
+            vec![
+                "3".to_string(),
+                "z".to_string(),
+                "3".to_string(),
+                "q".to_string()
+            ],
         ]
     );
 }
@@ -1350,10 +1357,7 @@ fn test_foreign_key_add_constraint_validation() {
         "parent".to_string(),
         vec!["id".to_string()],
     ));
-    assert!(matches!(
-        add_fk,
-        Err(DatabaseError::ForeignKeyViolation(_))
-    ));
+    assert!(matches!(add_fk, Err(DatabaseError::ForeignKeyViolation(_))));
 
     let where_clauses = vec![WhereClause::Op(
         TableColumn {

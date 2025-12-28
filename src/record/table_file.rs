@@ -297,8 +297,7 @@ impl Iterator for TableScanIter {
             }
 
             let mut buffer_manager = self.buffer_manager.lock().unwrap();
-            let page_buffer = match buffer_manager.get_page_mut(self.file_handle, self.page_id)
-            {
+            let page_buffer = match buffer_manager.get_page_mut(self.file_handle, self.page_id) {
                 Ok(buf) => buf,
                 Err(err) => return Some(Err(err.into())),
             };

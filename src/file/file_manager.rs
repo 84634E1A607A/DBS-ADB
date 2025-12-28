@@ -119,9 +119,10 @@ impl PagedFileManager {
 
         // If file is open, close it first
         if let Ok(canonical_path) = path.canonicalize()
-            && let Some(&handle) = self.path_to_handle.get(&canonical_path) {
-                self.close_file(handle)?;
-            }
+            && let Some(&handle) = self.path_to_handle.get(&canonical_path)
+        {
+            self.close_file(handle)?;
+        }
 
         std::fs::remove_file(path)?;
         Ok(())

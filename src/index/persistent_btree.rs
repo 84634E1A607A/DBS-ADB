@@ -297,11 +297,6 @@ impl PersistentBPlusTree {
         self.tree.is_empty()
     }
 
-    /// Get file handle
-    pub fn file_handle(&self) -> FileHandle {
-        self.file_handle
-    }
-
     // Helper methods
 
     /// Mark all nodes as dirty (simplified approach)
