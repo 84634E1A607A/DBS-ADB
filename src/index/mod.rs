@@ -299,9 +299,8 @@ impl IndexManager {
 
         // Delete the file
         let file_path = format!("{}/{}_{}.idx", db_path, table_name, column_name);
-        std::fs::remove_file(&file_path).map_err(|e| {
-            IndexError::SerializationError(format!("Failed to delete index file: {}", e))
-        })?;
+        let mut buffer_manager = self.buffer_manager.lock().unwrap();
+        buffer_manager.file_manager_mut().remove_file(&file_path)?;
 
         Ok(())
     }

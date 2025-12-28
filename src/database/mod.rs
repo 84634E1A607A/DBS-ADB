@@ -1765,6 +1765,103 @@ impl DatabaseManager {
         Ok(defs)
     }
 
+    fn rebuild_index_for_columns(
+        &mut self,
+        db_path: &str,
+        table_meta: &TableMetadata,
+        schema: &TableSchema,
+        columns: &[String],
+    ) -> DatabaseResult<()> {
+        let storage_name = match Self::index_storage_name(columns) {
+            Some(name) => name,
+            None => {
+                return Err(DatabaseError::TypeMismatch(
+                    "Composite index requires exactly two columns".to_string(),
+                ))
+            }
+        };
+        if columns.len() != 1 && columns.len() != 2 {
+            return Err(DatabaseError::TypeMismatch(
+                "Only one- or two-column indexes are supported".to_string(),
+            ));
+        }
+
+        let mut col_indices = Vec::with_capacity(columns.len());
+        for col_name in columns {
+            let col_idx = table_meta
+                .columns
+                .iter()
+                .position(|c| &c.name == col_name)
+                .ok_or_else(|| {
+                    DatabaseError::ColumnNotFound(col_name.clone(), table_meta.name.clone())
+                })?;
+            if table_meta.columns[col_idx].to_data_type() != DataType::Int {
+                return Err(DatabaseError::TypeMismatch(
+                    "Only INT columns can be indexed".to_string(),
+                ));
+            }
+            col_indices.push(col_idx);
+        }
+
+        let table_path = PathBuf::from(db_path).join(format!("{}.tbl", table_meta.name));
+        let _ = self
+            .record_manager
+            .open_table(table_path.to_string_lossy().as_ref(), schema.clone());
+
+        let _ = self
+            .index_manager
+            .drop_index(db_path, &table_meta.name, &storage_name);
+
+        let scan_iter = self.record_manager.scan_iter(&table_meta.name)?;
+        if col_indices.len() == 1 {
+            let table_iter = TableIntColumnIter::new(scan_iter, col_indices[0]);
+            self.index_manager.create_index_from_table(
+                db_path,
+                &table_meta.name,
+                &storage_name,
+                table_iter,
+            )?;
+        } else {
+            let table_iter =
+                TableCompositeIntColumnIter::new(scan_iter, col_indices[0], col_indices[1]);
+            self.index_manager.create_index_from_table(
+                db_path,
+                &table_meta.name,
+                &storage_name,
+                table_iter,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_index_open_for_columns(
+        &mut self,
+        db_path: &str,
+        table_meta: &TableMetadata,
+        schema: &TableSchema,
+        columns: &[String],
+    ) -> DatabaseResult<bool> {
+        let storage_name = match Self::index_storage_name(columns) {
+            Some(name) => name,
+            None => return Ok(false),
+        };
+        match self
+            .index_manager
+            .open_index(db_path, &table_meta.name, &storage_name)
+        {
+            Ok(()) => Ok(true),
+            Err(IndexError::IndexNotFound(_))
+            | Err(IndexError::InvalidMagic)
+            | Err(IndexError::UnsupportedVersion(_))
+            | Err(IndexError::CorruptedNode(_)) => {
+                self.rebuild_index_for_columns(db_path, table_meta, schema, columns)?;
+                Ok(true)
+            }
+            Err(err) => Err(DatabaseError::IndexError(err)),
+        }
+    }
+
     fn index_candidates_for_where(
         &mut self,
         db_path: &str,
@@ -1810,18 +1907,13 @@ impl DatabaseManager {
                 Some(val) => *val,
                 None => continue,
             };
+            if !self.ensure_index_open_for_columns(db_path, table_meta, schema, columns)? {
+                continue;
+            }
             let storage_name = match Self::index_storage_name(columns) {
                 Some(name) => name,
                 None => continue,
             };
-            match self
-                .index_manager
-                .open_index(db_path, table_name, &storage_name)
-            {
-                Ok(()) => {}
-                Err(IndexError::IndexNotFound(_)) => continue,
-                Err(err) => return Err(DatabaseError::IndexError(err)),
-            }
             let key = Self::composite_key_from_i64(left_val, right_val);
             let mut rids = self
                 .index_manager
@@ -1871,18 +1963,13 @@ impl DatabaseManager {
                 continue;
             }
 
+            if !self.ensure_index_open_for_columns(db_path, table_meta, schema, columns)? {
+                continue;
+            }
             let storage_name = match Self::index_storage_name(columns) {
                 Some(name) => name,
                 None => continue,
             };
-            match self
-                .index_manager
-                .open_index(db_path, table_name, &storage_name)
-            {
-                Ok(()) => {}
-                Err(IndexError::IndexNotFound(_)) => continue,
-                Err(err) => return Err(DatabaseError::IndexError(err)),
-            }
 
             let left_min = lower.unwrap_or(0).clamp(i64::from(i32::MIN), i64::from(i32::MAX));
             let left_max = upper
@@ -1913,13 +2000,13 @@ impl DatabaseManager {
                     if schema.columns[col_idx].data_type != DataType::Int {
                         continue;
                     }
-                    match self
-                        .index_manager
-                        .open_index(db_path, table_name, &col.column)
-                    {
-                        Ok(()) => {}
-                        Err(IndexError::IndexNotFound(_)) => continue,
-                        Err(err) => return Err(DatabaseError::IndexError(err)),
+                    if !self.ensure_index_open_for_columns(
+                        db_path,
+                        table_meta,
+                        schema,
+                        &vec![col.column.clone()],
+                    )? {
+                        continue;
                     }
 
                     let mut rids = match op {
@@ -1954,13 +2041,13 @@ impl DatabaseManager {
                     if schema.columns[col_idx].data_type != DataType::Int {
                         continue;
                     }
-                    match self
-                        .index_manager
-                        .open_index(db_path, table_name, &col.column)
-                    {
-                        Ok(()) => {}
-                        Err(IndexError::IndexNotFound(_)) => continue,
-                        Err(err) => return Err(DatabaseError::IndexError(err)),
+                    if !self.ensure_index_open_for_columns(
+                        db_path,
+                        table_meta,
+                        schema,
+                        &vec![col.column.clone()],
+                    )? {
+                        continue;
                     }
 
                     let mut rids = Vec::new();

@@ -167,6 +167,7 @@ impl PersistentBPlusTree {
     /// Close the index file (flushes automatically)
     pub fn close(mut self, buffer_mgr: &mut BufferManager) -> IndexResult<()> {
         self.flush(buffer_mgr)?;
+        buffer_mgr.file_manager_mut().close_file(self.file_handle)?;
         Ok(())
     }
 
