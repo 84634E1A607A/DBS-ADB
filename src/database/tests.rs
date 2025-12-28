@@ -626,6 +626,121 @@ fn test_select_with_multiple_where() {
 }
 
 #[test]
+fn test_select_order_by_limit_offset() {
+    let (_temp, mut db_manager) = setup_test_db();
+
+    db_manager.create_database("testdb").unwrap();
+    db_manager.use_database("testdb").unwrap();
+
+    let fields = vec![
+        CreateTableField::Col("a".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Col(
+            "b".to_string(),
+            ColumnType::Char(10),
+            true,
+            ParserValue::Null,
+        ),
+    ];
+
+    db_manager.create_table("test", fields).unwrap();
+
+    let rows = vec![
+        vec![
+            ParserValue::Integer(1),
+            ParserValue::String("one".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(2),
+            ParserValue::String("two".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(3),
+            ParserValue::String("three".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(4),
+            ParserValue::String("four".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(5),
+            ParserValue::String("five".to_string()),
+        ],
+    ];
+    db_manager.insert("test", rows).unwrap();
+
+    let clause = SelectClause {
+        selectors: Selectors::List(vec![Selector::Column(TableColumn {
+            table: None,
+            column: "b".to_string(),
+        })]),
+        table: vec!["test".to_string()],
+        where_clauses: vec![],
+        group_by: None,
+        order_by: Some((
+            TableColumn {
+                table: None,
+                column: "a".to_string(),
+            },
+            false,
+        )),
+        limit: Some(2),
+        offset: Some(1),
+    };
+
+    let (headers, rows) = db_manager.select(clause).unwrap();
+    assert_eq!(headers, vec!["b"]);
+    assert_eq!(
+        rows,
+        vec![vec!["four".to_string()], vec!["three".to_string()]]
+    );
+}
+
+#[test]
+fn test_select_order_by_offset_past_end() {
+    let (_temp, mut db_manager) = setup_test_db();
+
+    db_manager.create_database("testdb").unwrap();
+    db_manager.use_database("testdb").unwrap();
+
+    let fields = vec![CreateTableField::Col(
+        "a".to_string(),
+        ColumnType::Int,
+        true,
+        ParserValue::Null,
+    )];
+
+    db_manager.create_table("test", fields).unwrap();
+    db_manager
+        .insert(
+            "test",
+            vec![
+                vec![ParserValue::Integer(1)],
+                vec![ParserValue::Integer(2)],
+            ],
+        )
+        .unwrap();
+
+    let clause = SelectClause {
+        selectors: Selectors::All,
+        table: vec!["test".to_string()],
+        where_clauses: vec![],
+        group_by: None,
+        order_by: Some((
+            TableColumn {
+                table: None,
+                column: "a".to_string(),
+            },
+            true,
+        )),
+        limit: None,
+        offset: Some(5),
+    };
+
+    let (_, rows) = db_manager.select(clause).unwrap();
+    assert!(rows.is_empty());
+}
+
+#[test]
 fn test_update() {
     let (_temp, mut db_manager) = setup_test_db();
 

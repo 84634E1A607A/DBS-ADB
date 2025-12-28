@@ -11,3 +11,5 @@ run:
     - comb
     - join
     - fk
+    - order
+    - aggregate

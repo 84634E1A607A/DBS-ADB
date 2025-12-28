@@ -933,10 +933,17 @@ impl DatabaseManager {
             }
         };
 
+        let order_by_idx = clause
+            .order_by
+            .as_ref()
+            .map(|(col, _)| self.resolve_single_column_index(&schema, col))
+            .transpose()?;
+
         // Scan table using streaming iterator
         let scan_iter = self.record_manager.scan_iter(table_name)?;
 
         let mut result_rows = Vec::new();
+        let mut order_rows = Vec::new();
         for item in scan_iter {
             let (_rid, record) = item?;
             // Evaluate WHERE clause
@@ -952,9 +959,44 @@ impl DatabaseManager {
                     let value = record.get(idx).unwrap();
                     row.push(self.format_value(value));
                 }
-                result_rows.push(row);
+
+                if let Some(order_idx) = order_by_idx {
+                    let key = record.get(order_idx).unwrap().clone();
+                    order_rows.push((key, row));
+                } else {
+                    result_rows.push(row);
+                }
             }
         }
+
+        let mut result_rows = if let Some((_, asc)) = clause.order_by {
+            let mut ordering_error = None;
+            order_rows.sort_by(|(left_key, _), (right_key, _)| {
+                match self.compare_order_values(left_key, right_key) {
+                    Ok(ordering) => {
+                        if asc {
+                            ordering
+                        } else {
+                            ordering.reverse()
+                        }
+                    }
+                    Err(err) => {
+                        if ordering_error.is_none() {
+                            ordering_error = Some(err);
+                        }
+                        Ordering::Equal
+                    }
+                }
+            });
+            if let Some(err) = ordering_error {
+                return Err(err);
+            }
+            order_rows.into_iter().map(|(_, row)| row).collect()
+        } else {
+            result_rows
+        };
+
+        result_rows = self.apply_limit_offset(result_rows, clause.limit, clause.offset);
 
         Ok((selected_columns, result_rows))
     }
@@ -1048,8 +1090,23 @@ impl DatabaseManager {
             }
         };
 
+        let order_by_ref = clause
+            .order_by
+            .as_ref()
+            .map(|(col, _)| {
+                self.resolve_join_column_ref(
+                    col,
+                    left_name,
+                    &left_schema,
+                    right_name,
+                    &right_schema,
+                )
+            })
+            .transpose()?;
+
         let scan_iter = self.record_manager.scan_iter(left_name)?;
         let mut result_rows = Vec::new();
+        let mut order_rows = Vec::new();
 
         for item in scan_iter {
             let (_rid, left_record) = item?;
@@ -1077,10 +1134,49 @@ impl DatabaseManager {
                         };
                         row.push(self.format_value(value));
                     }
-                    result_rows.push(row);
+
+                    if let Some(order_ref) = &order_by_ref {
+                        let key = match order_ref.side {
+                            JoinSide::Left => left_record.get(order_ref.index).unwrap(),
+                            JoinSide::Right => right_record.get(order_ref.index).unwrap(),
+                        }
+                        .clone();
+                        order_rows.push((key, row));
+                    } else {
+                        result_rows.push(row);
+                    }
                 }
             }
         }
+
+        let mut result_rows = if let Some((_, asc)) = clause.order_by {
+            let mut ordering_error = None;
+            order_rows.sort_by(|(left_key, _), (right_key, _)| {
+                match self.compare_order_values(left_key, right_key) {
+                    Ok(ordering) => {
+                        if asc {
+                            ordering
+                        } else {
+                            ordering.reverse()
+                        }
+                    }
+                    Err(err) => {
+                        if ordering_error.is_none() {
+                            ordering_error = Some(err);
+                        }
+                        Ordering::Equal
+                    }
+                }
+            });
+            if let Some(err) = ordering_error {
+                return Err(err);
+            }
+            order_rows.into_iter().map(|(_, row)| row).collect()
+        } else {
+            result_rows
+        };
+
+        result_rows = self.apply_limit_offset(result_rows, clause.limit, clause.offset);
 
         Ok((selected_columns, result_rows))
     }
@@ -1243,6 +1339,8 @@ impl DatabaseManager {
                 )?);
             }
         }
+
+        let rows = self.apply_limit_offset(rows, clause.limit, clause.offset);
 
         Ok((headers, rows))
     }
@@ -1522,6 +1620,44 @@ impl DatabaseManager {
             _ => Err(DatabaseError::TypeMismatch(
                 "Aggregate comparison type mismatch".to_string(),
             )),
+        }
+    }
+
+    fn compare_order_values(
+        &self,
+        left: &RecordValue,
+        right: &RecordValue,
+    ) -> DatabaseResult<Ordering> {
+        match (left, right) {
+            (RecordValue::Null, RecordValue::Null) => Ok(Ordering::Equal),
+            (RecordValue::Null, _) => Ok(Ordering::Less),
+            (_, RecordValue::Null) => Ok(Ordering::Greater),
+            (RecordValue::Int(l), RecordValue::Int(r)) => Ok(l.cmp(r)),
+            (RecordValue::Float(l), RecordValue::Float(r)) => l
+                .partial_cmp(r)
+                .ok_or_else(|| DatabaseError::TypeMismatch("Invalid float comparison".to_string())),
+            (RecordValue::String(l), RecordValue::String(r)) => Ok(l.cmp(r)),
+            _ => Err(DatabaseError::TypeMismatch(
+                "ORDER BY comparison type mismatch".to_string(),
+            )),
+        }
+    }
+
+    fn apply_limit_offset(
+        &self,
+        rows: Vec<Vec<String>>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Vec<Vec<String>> {
+        let start = offset.unwrap_or(0);
+        if start >= rows.len() {
+            return Vec::new();
+        }
+
+        let iter = rows.into_iter().skip(start);
+        match limit {
+            Some(count) => iter.take(count).collect(),
+            None => iter.collect(),
         }
     }
 
