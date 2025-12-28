@@ -118,6 +118,62 @@ impl Iterator for TableIntColumnIter {
     }
 }
 
+struct TableCompositeIntColumnIter {
+    scan_iter: TableScanIter,
+    col_idx_left: usize,
+    col_idx_right: usize,
+}
+
+impl TableCompositeIntColumnIter {
+    fn new(scan_iter: TableScanIter, col_idx_left: usize, col_idx_right: usize) -> Self {
+        Self {
+            scan_iter,
+            col_idx_left,
+            col_idx_right,
+        }
+    }
+
+    fn composite_key(left: i32, right: i32) -> i64 {
+        let left = left as u32 as u64;
+        let right = right as u32 as u64;
+        ((left << 32) | right) as i64
+    }
+}
+
+impl Iterator for TableCompositeIntColumnIter {
+    type Item = crate::index::IndexResult<(RecordId, i64)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let item = self.scan_iter.next()?;
+            match item {
+                Ok((rid, record)) => {
+                    let left = match record.get(self.col_idx_left) {
+                        Some(RecordValue::Int(val)) => *val,
+                        _ => continue,
+                    };
+                    let right = match record.get(self.col_idx_right) {
+                        Some(RecordValue::Int(val)) => *val,
+                        _ => continue,
+                    };
+                    return Some(Ok((rid, Self::composite_key(left, right))));
+                }
+                Err(err) => {
+                    return Some(Err(crate::index::IndexError::SerializationError(
+                        err.to_string(),
+                    )));
+                }
+            }
+        }
+    }
+}
+
+struct IndexDef {
+    columns: Vec<String>,
+    indices: Vec<usize>,
+    storage_name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum GroupKey {
     Int(i32),
@@ -575,6 +631,60 @@ impl DatabaseManager {
                         }
                     }
                 }
+            } else if pk_cols.len() == 2 {
+                let pk_indices = pk_indices.as_ref().unwrap();
+                let storage_name = match Self::index_storage_name(pk_cols) {
+                    Some(name) => name,
+                    None => String::new(),
+                };
+                let mut used_index = false;
+                if self.use_indexes && !storage_name.is_empty() {
+                    let has_index = self
+                        .index_manager
+                        .open_index(&db_path.to_string_lossy(), table, &storage_name)
+                        .is_ok();
+                    if has_index {
+                        used_index = true;
+                        for record in &records {
+                            let left = match record.get(pk_indices[0]).unwrap() {
+                                RecordValue::Int(val) => *val,
+                                _ => continue,
+                            };
+                            let right = match record.get(pk_indices[1]).unwrap() {
+                                RecordValue::Int(val) => *val,
+                                _ => continue,
+                            };
+                            let key =
+                                TableCompositeIntColumnIter::composite_key(left, right);
+                            if self
+                                .index_manager
+                                .search(table, &storage_name, key)
+                                .is_some()
+                            {
+                                return Err(DatabaseError::PrimaryKeyViolation);
+                            }
+                        }
+                    }
+                }
+
+                if !used_index {
+                    // Multi-column PK: use table scan (but only once for the whole batch)
+                    let existing_records = self.record_manager.scan(table)?;
+                    for record in &records {
+                        for (_, existing_record) in &existing_records {
+                            let mut is_duplicate = true;
+                            for &pk_idx in pk_indices {
+                                if record.get(pk_idx) != existing_record.get(pk_idx) {
+                                    is_duplicate = false;
+                                    break;
+                                }
+                            }
+                            if is_duplicate {
+                                return Err(DatabaseError::PrimaryKeyViolation);
+                            }
+                        }
+                    }
+                }
             } else {
                 // Multi-column PK: use table scan (but only once for the whole batch)
                 let existing_records = self.record_manager.scan(table)?;
@@ -599,19 +709,39 @@ impl DatabaseManager {
             self.validate_foreign_keys_for_records(&table_meta, &records)?;
         }
 
-        let indexed_columns = if skip_index_update {
+        let indexed_defs = if skip_index_update {
             Vec::new()
         } else {
-            self.open_indexed_columns(&db_path_str, &table_meta)?
+            self.open_indexed_defs(&db_path_str, &table_meta)?
         };
         let mut index_keys: Vec<Vec<Option<i64>>> = Vec::new();
-        if !indexed_columns.is_empty() {
+        if !indexed_defs.is_empty() {
             index_keys.reserve(records.len());
             for record in &records {
-                let mut row_keys = Vec::with_capacity(indexed_columns.len());
-                for (_, col_idx) in &indexed_columns {
-                    let key = match record.get(*col_idx) {
-                        Some(RecordValue::Int(val)) => Some(*val as i64),
+                let mut row_keys = Vec::with_capacity(indexed_defs.len());
+                for def in &indexed_defs {
+                    let key = match def.indices.as_slice() {
+                        [col_idx] => match record.get(*col_idx) {
+                            Some(RecordValue::Int(val)) => Some(*val as i64),
+                            _ => None,
+                        },
+                        [left_idx, right_idx] => {
+                            let left = match record.get(*left_idx) {
+                                Some(RecordValue::Int(val)) => *val,
+                                _ => {
+                                    row_keys.push(None);
+                                    continue;
+                                }
+                            };
+                            let right = match record.get(*right_idx) {
+                                Some(RecordValue::Int(val)) => *val,
+                                _ => {
+                                    row_keys.push(None);
+                                    continue;
+                                }
+                            };
+                            Some(TableCompositeIntColumnIter::composite_key(left, right))
+                        }
                         _ => None,
                     };
                     row_keys.push(key);
@@ -623,12 +753,13 @@ impl DatabaseManager {
         // Insert all records in one batch - much faster as it holds the lock only once
         let record_ids = self.record_manager.bulk_insert(table, records)?;
 
-        if !indexed_columns.is_empty() {
+        if !indexed_defs.is_empty() {
             for (row_idx, rid) in record_ids.iter().enumerate() {
                 let row_keys = &index_keys[row_idx];
-                for (col_idx, (col_name, _)) in indexed_columns.iter().enumerate() {
-                    if let Some(key) = row_keys[col_idx] {
-                        self.index_manager.insert(table, col_name, key, *rid)?;
+                for (def_idx, def) in indexed_defs.iter().enumerate() {
+                    if let Some(key) = row_keys[def_idx] {
+                        self.index_manager
+                            .insert(table, &def.storage_name, key, *rid)?;
                     }
                 }
             }
@@ -674,11 +805,11 @@ impl DatabaseManager {
             None => None,
         };
 
-        let indexed_columns = self.open_indexed_columns(&db_path_str, &table_meta)?;
+        let indexed_defs = self.open_indexed_defs(&db_path_str, &table_meta)?;
         let mut deleted = 0;
         let mut targets = Vec::new();
         let index_candidates =
-            self.index_candidates_for_where(&db_path_str, table, &schema, where_slice)?;
+            self.index_candidates_for_where(&db_path_str, &table_meta, &schema, where_slice)?;
         if let Some(rids) = index_candidates {
             for rid in rids {
                 let record = self.record_manager.get(table, rid)?;
@@ -721,12 +852,30 @@ impl DatabaseManager {
 
         for (rid, record) in targets {
             self.record_manager.delete(table, rid)?;
-            if !indexed_columns.is_empty() {
-                for (col_name, col_idx) in &indexed_columns {
-                    if let Some(RecordValue::Int(val)) = record.get(*col_idx) {
+            if !indexed_defs.is_empty() {
+                for def in &indexed_defs {
+                    let key = match def.indices.as_slice() {
+                        [col_idx] => match record.get(*col_idx) {
+                            Some(RecordValue::Int(val)) => Some(*val as i64),
+                            _ => None,
+                        },
+                        [left_idx, right_idx] => {
+                            let left = match record.get(*left_idx) {
+                                Some(RecordValue::Int(val)) => *val,
+                                _ => continue,
+                            };
+                            let right = match record.get(*right_idx) {
+                                Some(RecordValue::Int(val)) => *val,
+                                _ => continue,
+                            };
+                            Some(TableCompositeIntColumnIter::composite_key(left, right))
+                        }
+                        _ => None,
+                    };
+                    if let Some(key) = key {
                         let _ = self
                             .index_manager
-                            .delete_entry(table, col_name, *val as i64, rid)?;
+                            .delete_entry(table, &def.storage_name, key, rid)?;
                     }
                 }
             }
@@ -793,10 +942,10 @@ impl DatabaseManager {
                     .any(|idx| update_indices.contains(idx))
             });
 
-        let indexed_columns = if update_indices.is_empty() {
+        let indexed_defs = if update_indices.is_empty() {
             Vec::new()
         } else {
-            self.open_indexed_columns(&db_path_str, &table_meta)?
+            self.open_indexed_defs(&db_path_str, &table_meta)?
         };
         let where_slice: &[WhereClause] = match &where_clauses {
             Some(clauses) => clauses,
@@ -809,7 +958,7 @@ impl DatabaseManager {
         let mut updated = 0;
         let mut targets = Vec::new();
         let index_candidates =
-            self.index_candidates_for_where(&db_path_str, table, &schema, where_slice)?;
+            self.index_candidates_for_where(&db_path_str, &table_meta, &schema, where_slice)?;
         if let Some(rids) = index_candidates {
             for rid in rids {
                 let record = self.record_manager.get(table, rid)?;
@@ -897,43 +1046,64 @@ impl DatabaseManager {
 
             let updated_record = record.clone();
             self.record_manager.update(table, rid, updated_record)?;
-            if !indexed_columns.is_empty() {
-                for (col_name, col_idx) in &indexed_columns {
-                    if !update_indices.contains(col_idx) {
+            if !indexed_defs.is_empty() {
+                for def in &indexed_defs {
+                    let mut uses_update = false;
+                    for idx in &def.indices {
+                        if update_indices.contains(idx) {
+                            uses_update = true;
+                            break;
+                        }
+                    }
+                    if !uses_update {
                         continue;
                     }
-                    let old_val = original.get(*col_idx).unwrap();
-                    let new_val = record.get(*col_idx).unwrap();
-                    match (old_val, new_val) {
-                        (RecordValue::Int(old_key), RecordValue::Int(new_key)) => {
-                            if old_key != new_key {
-                                let _ = self.index_manager.delete_entry(
-                                    table,
-                                    col_name,
-                                    *old_key as i64,
-                                    rid,
-                                )?;
-                                self.index_manager.insert(
-                                    table,
-                                    col_name,
-                                    *new_key as i64,
-                                    rid,
-                                )?;
-                            }
-                        }
-                        (RecordValue::Int(old_key), _) => {
-                            let _ = self.index_manager.delete_entry(
-                                table,
-                                col_name,
-                                *old_key as i64,
-                                rid,
-                            )?;
-                        }
-                        (_, RecordValue::Int(new_key)) => {
-                            self.index_manager
-                                .insert(table, col_name, *new_key as i64, rid)?;
-                        }
-                        _ => {}
+
+                    let old_key = match def.indices.as_slice() {
+                        [col_idx] => match original.get(*col_idx).unwrap() {
+                            RecordValue::Int(val) => Some(*val as i64),
+                            _ => None,
+                        },
+                        [left_idx, right_idx] => match (
+                            original.get(*left_idx).unwrap(),
+                            original.get(*right_idx).unwrap(),
+                        ) {
+                            (RecordValue::Int(left), RecordValue::Int(right)) => Some(
+                                TableCompositeIntColumnIter::composite_key(*left, *right),
+                            ),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let new_key = match def.indices.as_slice() {
+                        [col_idx] => match record.get(*col_idx).unwrap() {
+                            RecordValue::Int(val) => Some(*val as i64),
+                            _ => None,
+                        },
+                        [left_idx, right_idx] => match (
+                            record.get(*left_idx).unwrap(),
+                            record.get(*right_idx).unwrap(),
+                        ) {
+                            (RecordValue::Int(left), RecordValue::Int(right)) => Some(
+                                TableCompositeIntColumnIter::composite_key(*left, *right),
+                            ),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+
+                    if old_key == new_key {
+                        continue;
+                    }
+
+                    if let Some(key) = old_key {
+                        let _ = self
+                            .index_manager
+                            .delete_entry(table, &def.storage_name, key, rid)?;
+                    }
+                    if let Some(key) = new_key {
+                        self.index_manager
+                            .insert(table, &def.storage_name, key, rid)?;
                     }
                 }
             }
@@ -960,14 +1130,16 @@ impl DatabaseManager {
         &mut self,
         clause: SelectClause,
     ) -> DatabaseResult<(Vec<String>, Vec<Vec<String>>)> {
-        let metadata = self
-            .current_metadata
-            .as_ref()
-            .ok_or(DatabaseError::NoDatabaseSelected)?;
-
         let table_name = &clause.table[0];
-        let table_meta = metadata.get_table(table_name)?;
-        let schema = self.metadata_to_schema(table_meta);
+        let (table_meta, schema) = {
+            let metadata = self
+                .current_metadata
+                .as_ref()
+                .ok_or(DatabaseError::NoDatabaseSelected)?;
+            let table_meta = metadata.get_table(table_name)?.clone();
+            let schema = self.metadata_to_schema(&table_meta);
+            (table_meta, schema)
+        };
 
         let db_name = self.current_db.as_ref().unwrap();
         let db_path = self.data_dir.join(db_name);
@@ -1025,7 +1197,7 @@ impl DatabaseManager {
         let mut order_rows = Vec::new();
         let index_candidates = self.index_candidates_for_where(
             db_path_str.as_ref(),
-            table_name,
+            &table_meta,
             &schema,
             &clause.where_clauses,
         )?;
@@ -1225,7 +1397,7 @@ impl DatabaseManager {
         let mut order_rows = Vec::new();
         let index_candidates = self.index_candidates_for_where(
             &self.data_dir.join(db_name).to_string_lossy(),
-            left_name,
+            &left_meta,
             &left_schema,
             &clause.where_clauses,
         )?;
@@ -1524,15 +1696,138 @@ impl DatabaseManager {
         }
     }
 
+    fn composite_key_from_i64(left: i64, right: i64) -> i64 {
+        let left = left as i32;
+        let right = right as i32;
+        TableCompositeIntColumnIter::composite_key(left, right)
+    }
+
+    fn index_storage_name(columns: &[String]) -> Option<String> {
+        match columns.len() {
+            1 => Some(columns[0].clone()),
+            2 => Some(format!("{}__{}", columns[0], columns[1])),
+            _ => None,
+        }
+    }
+
+    fn build_index_defs(&self, table_meta: &TableMetadata) -> DatabaseResult<Vec<IndexDef>> {
+        let mut defs = Vec::new();
+        let mut seen = HashSet::new();
+
+        let mut index_sets: Vec<Vec<String>> = Vec::new();
+        if let Some(pk_cols) = &table_meta.primary_key {
+            index_sets.push(pk_cols.clone());
+        }
+        for index_meta in &table_meta.indexes {
+            index_sets.push(index_meta.columns.clone());
+        }
+
+        for columns in index_sets {
+            let storage_name = match Self::index_storage_name(&columns) {
+                Some(name) => name,
+                None => continue,
+            };
+            if !seen.insert(storage_name.clone()) {
+                continue;
+            }
+            let mut indices = Vec::with_capacity(columns.len());
+            let mut valid = true;
+            for col_name in &columns {
+                let idx = match table_meta
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == col_name)
+                {
+                    Some(idx) => idx,
+                    None => {
+                        return Err(DatabaseError::ColumnNotFound(
+                            col_name.clone(),
+                            table_meta.name.clone(),
+                        ))
+                    }
+                };
+                if table_meta.columns[idx].to_data_type() != DataType::Int {
+                    valid = false;
+                    break;
+                }
+                indices.push(idx);
+            }
+            if !valid {
+                continue;
+            }
+            defs.push(IndexDef {
+                columns,
+                indices,
+                storage_name,
+            });
+        }
+
+        Ok(defs)
+    }
+
     fn index_candidates_for_where(
         &mut self,
         db_path: &str,
-        table_name: &str,
+        table_meta: &TableMetadata,
         schema: &TableSchema,
         where_clauses: &[WhereClause],
     ) -> DatabaseResult<Option<Vec<RecordId>>> {
         if !self.use_indexes || where_clauses.is_empty() {
             return Ok(None);
+        }
+
+        let table_name = &table_meta.name;
+        let mut eq_values: HashMap<String, i64> = HashMap::new();
+        for clause in where_clauses {
+            if let WhereClause::Op(col, Operator::Eq, Expression::Value(ParserValue::Integer(value))) =
+                clause
+            {
+                if !self.table_column_matches(table_name, col) {
+                    continue;
+                }
+                eq_values.insert(col.column.clone(), *value);
+            }
+        }
+
+        let mut composite_defs = Vec::new();
+        if let Some(pk_cols) = &table_meta.primary_key {
+            if pk_cols.len() == 2 {
+                composite_defs.push(pk_cols.clone());
+            }
+        }
+        for index_meta in &table_meta.indexes {
+            if index_meta.columns.len() == 2 {
+                composite_defs.push(index_meta.columns.clone());
+            }
+        }
+
+        for columns in composite_defs {
+            let left_val = match eq_values.get(&columns[0]) {
+                Some(val) => *val,
+                None => continue,
+            };
+            let right_val = match eq_values.get(&columns[1]) {
+                Some(val) => *val,
+                None => continue,
+            };
+            let storage_name = match Self::index_storage_name(&columns) {
+                Some(name) => name,
+                None => continue,
+            };
+            match self
+                .index_manager
+                .open_index(db_path, table_name, &storage_name)
+            {
+                Ok(()) => {}
+                Err(IndexError::IndexNotFound(_)) => continue,
+                Err(err) => return Err(DatabaseError::IndexError(err)),
+            }
+            let key = Self::composite_key_from_i64(left_val, right_val);
+            let mut rids = self
+                .index_manager
+                .search_all(table_name, &storage_name, key);
+            rids.sort_by_key(|rid| (rid.page_id, rid.slot_id));
+            return Ok(Some(rids));
         }
 
         for clause in where_clauses {
@@ -1959,29 +2254,14 @@ impl DatabaseManager {
         let db_path = self.data_dir.join(db_name);
         let db_path_str = db_path.to_string_lossy().to_string();
 
-        // Step 1: Collect all index information before dropping
-        let mut index_columns = Vec::new();
+        // Step 1: Collect all index definitions before dropping
+        let index_defs = self.build_index_defs(&table_meta)?;
 
-        // Add primary key index(es) if exists
-        if let Some(ref pk_cols) = table_meta.primary_key {
-            for col_name in pk_cols {
-                index_columns.push(col_name.clone());
-            }
-        }
-
-        // Add other indexes (indexes may be on multiple columns, take first for single-column indexes)
-        for index_meta in &table_meta.indexes {
-            for col_name in &index_meta.columns {
-                if !index_columns.contains(col_name) {
-                    index_columns.push(col_name.clone());
-                }
-            }
-        }
-
-        // Step 2: Drop all indexes (including primary key index)
-        for col_name in &index_columns {
-            // Attempt to drop - ignore error if index doesn't exist
-            let _ = self.index_manager.drop_index(&db_path_str, table, col_name);
+        // Step 2: Drop all indexes (including primary key indexes)
+        for def in &index_defs {
+            let _ = self
+                .index_manager
+                .drop_index(&db_path_str, table, &def.storage_name);
         }
 
         // Step 3: Clear all data from the table efficiently
@@ -2101,35 +2381,38 @@ impl DatabaseManager {
         );
 
         // Step 5: Reconstruct all indexes using bulk create
-        for col_name in &index_columns {
-            // Find the column index
-            let col_idx = table_meta
-                .columns
-                .iter()
-                .position(|c| &c.name == col_name)
-                .ok_or_else(|| {
-                    DatabaseError::ColumnNotFound(col_name.clone(), table.to_string())
-                })?;
-
-            // Scan table and extract values for this column using a streaming iterator
-            // to avoid loading all records into memory at once.
+        for def in &index_defs {
             let table_file = {
                 let mut buffer_manager = self.buffer_manager.lock().unwrap();
                 TableFile::open(&mut buffer_manager, &table_path_str, schema.clone())?
             };
             let scan_iter = table_file.scan_iter(self.buffer_manager.clone());
-            let table_data = TableIntColumnIter::new(scan_iter, col_idx);
 
-            // Use bulk create index function - it will consume the iterator
-            self.index_manager.create_index_from_table(
-                &db_path_str,
-                table,
-                col_name,
-                table_data,
-            )?;
+            match def.indices.as_slice() {
+                [col_idx] => {
+                    let table_data = TableIntColumnIter::new(scan_iter, *col_idx);
+                    self.index_manager.create_index_from_table(
+                        &db_path_str,
+                        table,
+                        &def.storage_name,
+                        table_data,
+                    )?;
+                }
+                [left_idx, right_idx] => {
+                    let table_data =
+                        TableCompositeIntColumnIter::new(scan_iter, *left_idx, *right_idx);
+                    self.index_manager.create_index_from_table(
+                        &db_path_str,
+                        table,
+                        &def.storage_name,
+                        table_data,
+                    )?;
+                }
+                _ => continue,
+            }
 
             // Flush and close the index immediately to free memory before building the next one.
-            self.index_manager.close_index(table, col_name)?;
+            self.index_manager.close_index(table, &def.storage_name)?;
 
             // Flush and clear buffer pool after each index creation
             // This releases ALL cached pages to prevent memory buildup.
@@ -2160,8 +2443,12 @@ impl DatabaseManager {
         Ok(())
     }
 
-    fn implicit_fk_index_name(&self, table: &str, column: &str) -> String {
-        format!("__fk_idx_{}_{}", table, column)
+    fn implicit_fk_index_name(&self, table: &str, columns: &[String]) -> String {
+        match columns.len() {
+            1 => format!("__fk_idx_{}_{}", table, columns[0]),
+            2 => format!("__fk_idx_{}_{}__{}", table, columns[0], columns[1]),
+            _ => format!("__fk_idx_{}_multi", table),
+        }
     }
 
     fn ensure_foreign_key_indexes(&mut self) -> DatabaseResult<bool> {
@@ -2175,20 +2462,48 @@ impl DatabaseManager {
             .as_ref()
             .ok_or(DatabaseError::NoDatabaseSelected)?;
 
-        let mut required: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut required_single: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut required_composite: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+        let mut required_composite_seen: HashMap<String, HashSet<String>> = HashMap::new();
         for (table_name, table_meta) in &metadata.tables {
             for fk in &table_meta.foreign_keys {
                 if fk.columns.len() == 1 {
-                    required
+                    required_single
                         .entry(table_name.clone())
                         .or_default()
                         .insert(fk.columns[0].clone());
                 }
                 if fk.ref_columns.len() == 1 {
-                    required
+                    required_single
                         .entry(fk.ref_table.clone())
                         .or_default()
                         .insert(fk.ref_columns[0].clone());
+                }
+                if fk.columns.len() == 2 {
+                    if let Some(name) = Self::index_storage_name(&fk.columns) {
+                        let seen = required_composite_seen
+                            .entry(table_name.clone())
+                            .or_default();
+                        if seen.insert(name) {
+                            required_composite
+                                .entry(table_name.clone())
+                                .or_default()
+                                .push(fk.columns.clone());
+                        }
+                    }
+                }
+                if fk.ref_columns.len() == 2 {
+                    if let Some(name) = Self::index_storage_name(&fk.ref_columns) {
+                        let seen = required_composite_seen
+                            .entry(fk.ref_table.clone())
+                            .or_default();
+                        if seen.insert(name) {
+                            required_composite
+                                .entry(fk.ref_table.clone())
+                                .or_default()
+                                .push(fk.ref_columns.clone());
+                        }
+                    }
                 }
             }
         }
@@ -2215,22 +2530,53 @@ impl DatabaseManager {
                     .ok_or_else(|| DatabaseError::TableNotFound(table_name.clone()))?
             };
 
-            let required_cols = required.get(&table_name).cloned().unwrap_or_default();
+            let required_cols = required_single
+                .get(&table_name)
+                .cloned()
+                .unwrap_or_default();
+            let required_comp = required_composite
+                .get(&table_name)
+                .cloned()
+                .unwrap_or_default();
+            let required_comp_names: HashSet<String> = required_comp
+                .iter()
+                .filter_map(|cols| Self::index_storage_name(cols))
+                .collect();
+
             let mut columns_to_drop = Vec::new();
             table_meta.indexes.retain(|idx| {
-                if idx.implicit
-                    && idx.columns.len() == 1
-                    && !required_cols.contains(&idx.columns[0])
-                {
-                    columns_to_drop.push(idx.columns[0].clone());
-                    updated = true;
-                    false
-                } else {
-                    true
+                if !idx.implicit {
+                    return true;
+                }
+                match idx.columns.len() {
+                    1 => {
+                        if !required_cols.contains(&idx.columns[0]) {
+                            columns_to_drop.push(idx.columns.clone());
+                            updated = true;
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    2 => {
+                        let name = match Self::index_storage_name(&idx.columns) {
+                            Some(name) => name,
+                            None => return true,
+                        };
+                        if !required_comp_names.contains(&name) {
+                            columns_to_drop.push(idx.columns.clone());
+                            updated = true;
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    _ => true,
                 }
             });
 
             let mut to_create = Vec::new();
+            let mut to_create_composite = Vec::new();
             for col_name in &required_cols {
                 if table_meta
                     .indexes
@@ -2251,12 +2597,47 @@ impl DatabaseManager {
                 }
                 to_create.push((col_name.clone(), col_idx));
             }
+            for columns in &required_comp {
+                if table_meta
+                    .indexes
+                    .iter()
+                    .any(|idx| idx.columns.len() == 2 && idx.columns == *columns)
+                {
+                    continue;
+                }
+                let left_idx = table_meta
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == &columns[0])
+                    .ok_or_else(|| {
+                        DatabaseError::ColumnNotFound(
+                            columns[0].clone(),
+                            table_meta.name.clone(),
+                        )
+                    })?;
+                let right_idx = table_meta
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == &columns[1])
+                    .ok_or_else(|| {
+                        DatabaseError::ColumnNotFound(
+                            columns[1].clone(),
+                            table_meta.name.clone(),
+                        )
+                    })?;
+                if table_meta.columns[left_idx].to_data_type() != DataType::Int
+                    || table_meta.columns[right_idx].to_data_type() != DataType::Int
+                {
+                    continue;
+                }
+                to_create_composite.push((columns.clone(), left_idx, right_idx));
+            }
 
             let db_path = self.data_dir.join(&db_name);
             let db_path_str = db_path.to_string_lossy().to_string();
             let schema = self.metadata_to_schema(&table_meta);
 
-            if !to_create.is_empty() {
+            if !to_create.is_empty() || !to_create_composite.is_empty() {
                 let table_path = self.table_path(&db_name, &table_meta.name);
                 self.record_manager
                     .open_table(&table_path.to_string_lossy(), schema)?;
@@ -2282,18 +2663,55 @@ impl DatabaseManager {
                 }
 
                 table_meta.indexes.push(IndexMetadata {
-                    name: self.implicit_fk_index_name(&table_meta.name, &col_name),
+                    name: self.implicit_fk_index_name(&table_meta.name, &vec![col_name.clone()]),
                     columns: vec![col_name],
                     implicit: true,
                 });
                 updated = true;
             }
 
-            for column_name in columns_to_drop {
-                if let Err(err) =
-                    self.index_manager
-                        .drop_index(&db_path_str, &table_meta.name, &column_name)
+            for (columns, left_idx, right_idx) in to_create_composite {
+                let storage_name = match Self::index_storage_name(&columns) {
+                    Some(name) => name,
+                    None => continue,
+                };
+                match self
+                    .index_manager
+                    .open_index(&db_path_str, &table_meta.name, &storage_name)
                 {
+                    Ok(()) => {}
+                    Err(IndexError::IndexNotFound(_)) => {
+                        let scan_iter = self.record_manager.scan_iter(&table_meta.name)?;
+                        let table_iter =
+                            TableCompositeIntColumnIter::new(scan_iter, left_idx, right_idx);
+                        self.index_manager.create_index_from_table(
+                            &db_path_str,
+                            &table_meta.name,
+                            &storage_name,
+                            table_iter,
+                        )?;
+                    }
+                    Err(err) => return Err(DatabaseError::IndexError(err)),
+                }
+
+                table_meta.indexes.push(IndexMetadata {
+                    name: self.implicit_fk_index_name(&table_meta.name, &columns),
+                    columns,
+                    implicit: true,
+                });
+                updated = true;
+            }
+
+            for columns in columns_to_drop {
+                let storage_name = match Self::index_storage_name(&columns) {
+                    Some(name) => name,
+                    None => continue,
+                };
+                if let Err(err) = self.index_manager.drop_index(
+                    &db_path_str,
+                    &table_meta.name,
+                    &storage_name,
+                ) {
                     if !matches!(err, crate::index::IndexError::IndexNotFound(_)) {
                         return Err(DatabaseError::IndexError(err));
                     }
@@ -2525,6 +2943,47 @@ impl DatabaseManager {
                     continue;
                 }
             }
+            if self.use_indexes && fk.column_indices.len() == 2 && fk.ref_column_indices.len() == 2
+            {
+                let (left, right) = match (&values[0], &values[1]) {
+                    (RecordValue::Int(l), RecordValue::Int(r)) => (*l, *r),
+                    _ => {
+                        return Err(DatabaseError::TypeMismatch(
+                            "Foreign key column must be INT".to_string(),
+                        ));
+                    }
+                };
+                let storage_name = match Self::index_storage_name(&fk.ref_column_names) {
+                    Some(name) => name,
+                    None => {
+                        return Err(DatabaseError::TypeMismatch(
+                            "Composite index requires exactly two columns".to_string(),
+                        ));
+                    }
+                };
+                let mut used_index = false;
+                let mut index_found = false;
+                match self.index_manager.open_index(
+                    &db_path_str,
+                    &fk.ref_table,
+                    &storage_name,
+                ) {
+                    Ok(()) => {
+                        used_index = true;
+                        let key = TableCompositeIntColumnIter::composite_key(left, right);
+                        index_found = self
+                            .index_manager
+                            .search(&fk.ref_table, &storage_name, key)
+                            .is_some();
+                    }
+                    Err(IndexError::IndexNotFound(_)) => {}
+                    Err(err) => return Err(DatabaseError::IndexError(err)),
+                };
+
+                if used_index && index_found {
+                    continue;
+                }
+            }
 
             let table_path = self.table_path(db_name, &fk.ref_table);
             let _ = self
@@ -2693,6 +3152,50 @@ impl DatabaseManager {
                     return Err(self.foreign_key_delete_error(fk, &values));
                 }
             }
+            if self.use_indexes
+                && fk.child_column_indices.len() == 2
+                && fk.parent_column_indices.len() == 2
+            {
+                let (left, right) = match (&values[0], &values[1]) {
+                    (RecordValue::Int(l), RecordValue::Int(r)) => (*l, *r),
+                    _ => {
+                        return Err(DatabaseError::TypeMismatch(
+                            "Foreign key column must be INT".to_string(),
+                        ));
+                    }
+                };
+                let storage_name = match Self::index_storage_name(&fk.child_column_names) {
+                    Some(name) => name,
+                    None => {
+                        return Err(DatabaseError::TypeMismatch(
+                            "Composite index requires exactly two columns".to_string(),
+                        ));
+                    }
+                };
+
+                let mut used_index = false;
+                let mut index_found = false;
+                match self.index_manager.open_index(
+                    db_path_str,
+                    &fk.child_table,
+                    &storage_name,
+                ) {
+                    Ok(()) => {
+                        used_index = true;
+                        let key = TableCompositeIntColumnIter::composite_key(left, right);
+                        index_found = self
+                            .index_manager
+                            .search(&fk.child_table, &storage_name, key)
+                            .is_some();
+                    }
+                    Err(IndexError::IndexNotFound(_)) => {}
+                    Err(err) => return Err(DatabaseError::IndexError(err)),
+                };
+
+                if used_index && index_found {
+                    return Err(self.foreign_key_delete_error(fk, &values));
+                }
+            }
 
             let table_path = self.table_path(db_name, &fk.child_table);
             let _ = self
@@ -2752,47 +3255,24 @@ impl DatabaseManager {
         }
     }
 
-    fn open_indexed_columns(
+    fn open_indexed_defs(
         &mut self,
         db_path: &str,
         table_meta: &TableMetadata,
-    ) -> DatabaseResult<Vec<(String, usize)>> {
-        let mut columns = Vec::new();
-        let mut seen = HashSet::new();
-        let mut candidates = Vec::new();
-
-        if let Some(pk_cols) = &table_meta.primary_key {
-            candidates.extend(pk_cols.iter().cloned());
-        }
-        for index_meta in &table_meta.indexes {
-            candidates.extend(index_meta.columns.iter().cloned());
-        }
-
-        for col_name in candidates {
-            if !seen.insert(col_name.clone()) {
-                continue;
-            }
-            let col_idx = table_meta
-                .columns
-                .iter()
-                .position(|c| c.name == col_name)
-                .ok_or_else(|| {
-                    DatabaseError::ColumnNotFound(col_name.clone(), table_meta.name.clone())
-                })?;
-            if table_meta.columns[col_idx].to_data_type() != DataType::Int {
-                continue;
-            }
+    ) -> DatabaseResult<Vec<IndexDef>> {
+        let defs = self.build_index_defs(table_meta)?;
+        let mut opened = Vec::new();
+        for def in defs {
             match self
                 .index_manager
-                .open_index(db_path, &table_meta.name, &col_name)
+                .open_index(db_path, &table_meta.name, &def.storage_name)
             {
-                Ok(()) => columns.push((col_name, col_idx)),
+                Ok(()) => opened.push(def),
                 Err(IndexError::IndexNotFound(_)) => {}
                 Err(err) => return Err(DatabaseError::IndexError(err)),
             }
         }
-
-        Ok(columns)
+        Ok(opened)
     }
 
     fn resolve_single_column_index(
@@ -3228,16 +3708,26 @@ impl DatabaseManager {
     pub fn execute_alter_statement(&mut self, stmt: AlterStatement) -> DatabaseResult<QueryResult> {
         match stmt {
             AlterStatement::AddIndex(table_name, index_name, columns) => {
-                if columns.len() != 1 {
+                if columns.is_empty() || columns.len() > 2 {
                     return Err(DatabaseError::TypeMismatch(
-                        "Only single-column indexes are supported".to_string(),
+                        "Only one- or two-column indexes are supported".to_string(),
                     ));
                 }
 
-                let column_name = columns[0].clone();
-                let index_name = index_name.unwrap_or_else(|| format!("idx_{}", column_name));
+                let index_name = if let Some(name) = index_name {
+                    name
+                } else if columns.len() == 1 {
+                    format!("idx_{}", columns[0])
+                } else {
+                    format!("idx_{}_{}", columns[0], columns[1])
+                };
+                let storage_name = Self::index_storage_name(&columns).ok_or_else(|| {
+                    DatabaseError::TypeMismatch(
+                        "Only one- or two-column indexes are supported".to_string(),
+                    )
+                })?;
 
-                let (schema, col_idx, reuse_implicit) = {
+                let (schema, col_indices, reuse_implicit) = {
                     let metadata = self
                         .current_metadata
                         .as_ref()
@@ -3266,22 +3756,28 @@ impl DatabaseManager {
                         )));
                     }
 
-                    let col_idx = table_meta
-                        .columns
-                        .iter()
-                        .position(|c| c.name == column_name)
-                        .ok_or_else(|| {
-                            DatabaseError::ColumnNotFound(column_name.clone(), table_name.clone())
-                        })?;
-
-                    if table_meta.columns[col_idx].to_data_type() != DataType::Int {
-                        return Err(DatabaseError::TypeMismatch(
-                            "Only INT columns can be indexed".to_string(),
-                        ));
+                    let mut col_indices = Vec::with_capacity(columns.len());
+                    for col_name in &columns {
+                        let col_idx = table_meta
+                            .columns
+                            .iter()
+                            .position(|c| c.name == *col_name)
+                            .ok_or_else(|| {
+                                DatabaseError::ColumnNotFound(
+                                    col_name.clone(),
+                                    table_name.clone(),
+                                )
+                            })?;
+                        if table_meta.columns[col_idx].to_data_type() != DataType::Int {
+                            return Err(DatabaseError::TypeMismatch(
+                                "Only INT columns can be indexed".to_string(),
+                            ));
+                        }
+                        col_indices.push(col_idx);
                     }
 
                     let schema = self.metadata_to_schema(&table_meta);
-                    (schema, col_idx, implicit_on_column)
+                    (schema, col_indices, implicit_on_column)
                 };
 
                 let db_name = self
@@ -3294,7 +3790,7 @@ impl DatabaseManager {
                 if reuse_implicit {
                     match self
                         .index_manager
-                        .open_index(&db_path_str, &table_name, &column_name)
+                        .open_index(&db_path_str, &table_name, &storage_name)
                     {
                         Ok(()) => {}
                         Err(IndexError::IndexNotFound(_)) => {
@@ -3304,13 +3800,27 @@ impl DatabaseManager {
                                 schema.clone(),
                             )?;
                             let scan_iter = self.record_manager.scan_iter(&table_name)?;
-                            let table_iter = TableIntColumnIter::new(scan_iter, col_idx);
-                            self.index_manager.create_index_from_table(
-                                &db_path_str,
-                                &table_name,
-                                &column_name,
-                                table_iter,
-                            )?;
+                            if col_indices.len() == 1 {
+                                let table_iter = TableIntColumnIter::new(scan_iter, col_indices[0]);
+                                self.index_manager.create_index_from_table(
+                                    &db_path_str,
+                                    &table_name,
+                                    &storage_name,
+                                    table_iter,
+                                )?;
+                            } else {
+                                let table_iter = TableCompositeIntColumnIter::new(
+                                    scan_iter,
+                                    col_indices[0],
+                                    col_indices[1],
+                                );
+                                self.index_manager.create_index_from_table(
+                                    &db_path_str,
+                                    &table_name,
+                                    &storage_name,
+                                    table_iter,
+                                )?;
+                            }
                         }
                         Err(err) => return Err(DatabaseError::IndexError(err)),
                     }
@@ -3340,13 +3850,27 @@ impl DatabaseManager {
                     .open_table(table_path.to_string_lossy().as_ref(), schema.clone())?;
 
                 let scan_iter = self.record_manager.scan_iter(&table_name)?;
-                let table_iter = TableIntColumnIter::new(scan_iter, col_idx);
-                self.index_manager.create_index_from_table(
-                    &db_path_str,
-                    &table_name,
-                    &column_name,
-                    table_iter,
-                )?;
+                if col_indices.len() == 1 {
+                    let table_iter = TableIntColumnIter::new(scan_iter, col_indices[0]);
+                    self.index_manager.create_index_from_table(
+                        &db_path_str,
+                        &table_name,
+                        &storage_name,
+                        table_iter,
+                    )?;
+                } else {
+                    let table_iter = TableCompositeIntColumnIter::new(
+                        scan_iter,
+                        col_indices[0],
+                        col_indices[1],
+                    );
+                    self.index_manager.create_index_from_table(
+                        &db_path_str,
+                        &table_name,
+                        &storage_name,
+                        table_iter,
+                    )?;
+                }
 
                 let metadata = self.current_metadata.as_mut().unwrap();
                 let table_meta_mut = metadata.get_table_mut(&table_name)?;
@@ -3388,16 +3912,20 @@ impl DatabaseManager {
                     })?;
 
                 let index_meta = table_meta.indexes.remove(pos);
-                if index_meta.columns.len() != 1 {
+                if index_meta.columns.is_empty() || index_meta.columns.len() > 2 {
                     return Err(DatabaseError::TypeMismatch(
-                        "Only single-column indexes are supported".to_string(),
+                        "Only one- or two-column indexes are supported".to_string(),
                     ));
                 }
-                let column_name = index_meta.columns[0].clone();
+                let storage_name = Self::index_storage_name(&index_meta.columns).ok_or_else(|| {
+                    DatabaseError::TypeMismatch(
+                        "Only one- or two-column indexes are supported".to_string(),
+                    )
+                })?;
 
                 if let Err(err) =
                     self.index_manager
-                        .drop_index(&db_path_str, &table_name, &column_name)
+                        .drop_index(&db_path_str, &table_name, &storage_name)
                     && !matches!(err, crate::index::IndexError::IndexNotFound(_))
                 {
                     return Err(DatabaseError::IndexError(err));

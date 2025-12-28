@@ -426,6 +426,205 @@ fn test_add_and_drop_index() {
 }
 
 #[test]
+fn test_composite_index_select_update_delete() {
+    let (temp_dir, mut db_manager) = setup_test_db();
+
+    db_manager.create_database("testdb").unwrap();
+    db_manager.use_database("testdb").unwrap();
+
+    let fields = vec![
+        CreateTableField::Col("a".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Col("b".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Col("c".to_string(), ColumnType::Int, false, ParserValue::Null),
+    ];
+    db_manager.create_table("tcomp", fields).unwrap();
+
+    let rows = vec![
+        vec![
+            ParserValue::Integer(1),
+            ParserValue::Integer(1),
+            ParserValue::Integer(10),
+        ],
+        vec![
+            ParserValue::Integer(1),
+            ParserValue::Integer(2),
+            ParserValue::Integer(20),
+        ],
+        vec![
+            ParserValue::Integer(2),
+            ParserValue::Integer(1),
+            ParserValue::Integer(30),
+        ],
+    ];
+    db_manager.insert("tcomp", rows).unwrap();
+
+    db_manager
+        .execute_alter_statement(AlterStatement::AddIndex(
+            "tcomp".to_string(),
+            None,
+            vec!["a".to_string(), "b".to_string()],
+        ))
+        .unwrap();
+
+    let meta = db_manager.describe_table("tcomp").unwrap();
+    assert_eq!(meta.indexes.len(), 1);
+    assert_eq!(meta.indexes[0].name, "idx_a_b");
+    assert_eq!(meta.indexes[0].columns, vec!["a".to_string(), "b".to_string()]);
+
+    let index_path = temp_dir
+        .path()
+        .join("testdb")
+        .join("tcomp_a__b.idx");
+    assert!(index_path.exists());
+
+    let clause = SelectClause {
+        selectors: Selectors::All,
+        table: vec!["tcomp".to_string()],
+        where_clauses: vec![
+            WhereClause::Op(
+                TableColumn {
+                    table: None,
+                    column: "a".to_string(),
+                },
+                Operator::Eq,
+                Expression::Value(ParserValue::Integer(1)),
+            ),
+            WhereClause::Op(
+                TableColumn {
+                    table: None,
+                    column: "b".to_string(),
+                },
+                Operator::Eq,
+                Expression::Value(ParserValue::Integer(2)),
+            ),
+        ],
+        group_by: None,
+        order_by: None,
+        limit: None,
+        offset: None,
+    };
+    let (_headers, rows) = db_manager.select(clause).unwrap();
+    assert_eq!(rows, vec![vec!["1", "2", "20"]]);
+
+    let updated = db_manager
+        .update(
+            "tcomp",
+            vec![("c".to_string(), ParserValue::Integer(99))],
+            Some(vec![
+                WhereClause::Op(
+                    TableColumn {
+                        table: None,
+                        column: "a".to_string(),
+                    },
+                    Operator::Eq,
+                    Expression::Value(ParserValue::Integer(1)),
+                ),
+                WhereClause::Op(
+                    TableColumn {
+                        table: None,
+                        column: "b".to_string(),
+                    },
+                    Operator::Eq,
+                    Expression::Value(ParserValue::Integer(2)),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    let clause = SelectClause {
+        selectors: Selectors::All,
+        table: vec!["tcomp".to_string()],
+        where_clauses: vec![
+            WhereClause::Op(
+                TableColumn {
+                    table: None,
+                    column: "a".to_string(),
+                },
+                Operator::Eq,
+                Expression::Value(ParserValue::Integer(1)),
+            ),
+            WhereClause::Op(
+                TableColumn {
+                    table: None,
+                    column: "b".to_string(),
+                },
+                Operator::Eq,
+                Expression::Value(ParserValue::Integer(2)),
+            ),
+        ],
+        group_by: None,
+        order_by: None,
+        limit: None,
+        offset: None,
+    };
+    let (_headers, rows) = db_manager.select(clause).unwrap();
+    assert_eq!(rows, vec![vec!["1", "2", "99"]]);
+
+    let deleted = db_manager
+        .delete(
+            "tcomp",
+            Some(vec![
+                WhereClause::Op(
+                    TableColumn {
+                        table: None,
+                        column: "a".to_string(),
+                    },
+                    Operator::Eq,
+                    Expression::Value(ParserValue::Integer(1)),
+                ),
+                WhereClause::Op(
+                    TableColumn {
+                        table: None,
+                        column: "b".to_string(),
+                    },
+                    Operator::Eq,
+                    Expression::Value(ParserValue::Integer(2)),
+                ),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(deleted, 1);
+
+    let clause = SelectClause {
+        selectors: Selectors::All,
+        table: vec!["tcomp".to_string()],
+        where_clauses: vec![
+            WhereClause::Op(
+                TableColumn {
+                    table: None,
+                    column: "a".to_string(),
+                },
+                Operator::Eq,
+                Expression::Value(ParserValue::Integer(1)),
+            ),
+            WhereClause::Op(
+                TableColumn {
+                    table: None,
+                    column: "b".to_string(),
+                },
+                Operator::Eq,
+                Expression::Value(ParserValue::Integer(2)),
+            ),
+        ],
+        group_by: None,
+        order_by: None,
+        limit: None,
+        offset: None,
+    };
+    let (_headers, rows) = db_manager.select(clause).unwrap();
+    assert!(rows.is_empty());
+
+    db_manager
+        .execute_alter_statement(AlterStatement::DropIndex(
+            "tcomp".to_string(),
+            "idx_a_b".to_string(),
+        ))
+        .unwrap();
+    assert!(!index_path.exists());
+}
+
+#[test]
 fn test_select_specific_columns() {
     let (_temp, mut db_manager) = setup_test_db();
 
