@@ -1,4 +1,5 @@
 use csv::ReaderBuilder;
+use regex::Regex;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -133,11 +134,22 @@ enum NumericType {
 #[derive(Debug, Clone)]
 enum AggSpec {
     CountAll,
-    Count { col_idx: usize },
-    Sum { col_idx: usize, numeric: NumericType },
-    Avg { col_idx: usize },
-    Min { col_idx: usize },
-    Max { col_idx: usize },
+    Count {
+        col_idx: usize,
+    },
+    Sum {
+        col_idx: usize,
+        numeric: NumericType,
+    },
+    Avg {
+        col_idx: usize,
+    },
+    Min {
+        col_idx: usize,
+    },
+    Max {
+        col_idx: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +200,13 @@ struct ReferencingForeignKeyCheck {
 enum JoinSide {
     Left,
     Right,
+}
+
+enum PreparedWhereClause {
+    Op(TableColumn, Operator, Expression),
+    Null(TableColumn),
+    NotNull(TableColumn),
+    Like(TableColumn, Regex),
 }
 
 #[derive(Clone, Copy)]
@@ -632,6 +651,10 @@ impl DatabaseManager {
             .open_table(&table_path_str, schema.clone());
 
         let referencing_checks = self.build_referencing_fk_checks(&table_meta)?;
+        let prepared_where = match &where_clauses {
+            Some(clauses) => Some(self.prepare_where_clauses(clauses)?),
+            None => None,
+        };
         if !referencing_checks.is_empty() {
             let db_name = self
                 .current_db
@@ -640,9 +663,9 @@ impl DatabaseManager {
             let scan_iter = self.record_manager.scan_iter(table)?;
             for item in scan_iter {
                 let (_rid, record) = item?;
-                let should_delete = match &where_clauses {
+                let should_delete = match &prepared_where {
                     None => true,
-                    Some(clauses) => self.evaluate_where(&record, &schema, clauses)?,
+                    Some(clauses) => self.evaluate_prepared_where(&record, &schema, clauses)?,
                 };
 
                 if should_delete {
@@ -661,9 +684,9 @@ impl DatabaseManager {
         let scan_iter = self.record_manager.scan_iter(table)?;
         for item in scan_iter {
             let (rid, record) = item?;
-            let should_delete = match &where_clauses {
+            let should_delete = match &prepared_where {
                 None => true,
-                Some(clauses) => self.evaluate_where(&record, &schema, clauses)?,
+                Some(clauses) => self.evaluate_prepared_where(&record, &schema, clauses)?,
             };
 
             if should_delete {
@@ -671,9 +694,12 @@ impl DatabaseManager {
                 if !indexed_columns.is_empty() {
                     for (col_name, col_idx) in &indexed_columns {
                         if let Some(RecordValue::Int(val)) = record.get(*col_idx) {
-                            let _ = self
-                                .index_manager
-                                .delete_entry(table, col_name, *val as i64, rid)?;
+                            let _ = self.index_manager.delete_entry(
+                                table,
+                                col_name,
+                                *val as i64,
+                                rid,
+                            )?;
                         }
                     }
                 }
@@ -746,13 +772,17 @@ impl DatabaseManager {
         } else {
             self.open_indexed_columns(&db_path_str, &table_meta)?
         };
+        let prepared_where = match &where_clauses {
+            Some(clauses) => Some(self.prepare_where_clauses(clauses)?),
+            None => None,
+        };
         let mut updated = 0;
         let scan_iter = self.record_manager.scan_iter(table)?;
         for item in scan_iter {
             let (rid, mut record) = item?;
-            let should_update = match &where_clauses {
+            let should_update = match &prepared_where {
                 None => true,
-                Some(clauses) => self.evaluate_where(&record, &schema, clauses)?,
+                Some(clauses) => self.evaluate_prepared_where(&record, &schema, clauses)?,
             };
 
             if should_update {
@@ -850,12 +880,8 @@ impl DatabaseManager {
                                 )?;
                             }
                             (_, RecordValue::Int(new_key)) => {
-                                self.index_manager.insert(
-                                    table,
-                                    col_name,
-                                    *new_key as i64,
-                                    rid,
-                                )?;
+                                self.index_manager
+                                    .insert(table, col_name, *new_key as i64, rid)?;
                             }
                             _ => {}
                         }
@@ -938,6 +964,11 @@ impl DatabaseManager {
             .as_ref()
             .map(|(col, _)| self.resolve_single_column_index(&schema, col))
             .transpose()?;
+        let prepared_where = if clause.where_clauses.is_empty() {
+            None
+        } else {
+            Some(self.prepare_where_clauses(&clause.where_clauses)?)
+        };
 
         // Scan table using streaming iterator
         let scan_iter = self.record_manager.scan_iter(table_name)?;
@@ -947,9 +978,9 @@ impl DatabaseManager {
         for item in scan_iter {
             let (_rid, record) = item?;
             // Evaluate WHERE clause
-            let matches = match &clause.where_clauses {
-                clauses if clauses.is_empty() => true,
-                clauses => self.evaluate_where(&record, &schema, clauses)?,
+            let matches = match &prepared_where {
+                None => true,
+                Some(clauses) => self.evaluate_prepared_where(&record, &schema, clauses)?,
             };
 
             if matches {
@@ -1103,6 +1134,11 @@ impl DatabaseManager {
                 )
             })
             .transpose()?;
+        let prepared_where = if clause.where_clauses.is_empty() {
+            None
+        } else {
+            Some(self.prepare_where_clauses(&clause.where_clauses)?)
+        };
 
         let scan_iter = self.record_manager.scan_iter(left_name)?;
         let mut result_rows = Vec::new();
@@ -1111,18 +1147,17 @@ impl DatabaseManager {
         for item in scan_iter {
             let (_rid, left_record) = item?;
             for right_record in &right_records {
-                let matches = if clause.where_clauses.is_empty() {
-                    true
-                } else {
-                    self.evaluate_join_where(
+                let matches = match &prepared_where {
+                    None => true,
+                    Some(clauses) => self.evaluate_prepared_join_where(
                         &left_record,
                         &left_schema,
                         left_name,
                         right_record,
                         &right_schema,
                         right_name,
-                        &clause.where_clauses,
-                    )?
+                        clauses,
+                    )?,
                 };
 
                 if matches {
@@ -1184,9 +1219,9 @@ impl DatabaseManager {
     fn select_has_aggregate(&self, selectors: &Selectors) -> bool {
         match selectors {
             Selectors::All => false,
-            Selectors::List(list) => list.iter().any(|selector| {
-                !matches!(selector, Selector::Column(_))
-            }),
+            Selectors::List(list) => list
+                .iter()
+                .any(|selector| !matches!(selector, Selector::Column(_))),
         }
     }
 
@@ -1276,6 +1311,11 @@ impl DatabaseManager {
         }
 
         let scan_iter = self.record_manager.scan_iter(table_name)?;
+        let prepared_where = if clause.where_clauses.is_empty() {
+            None
+        } else {
+            Some(self.prepare_where_clauses(&clause.where_clauses)?)
+        };
 
         let mut group_states = Vec::new();
         let mut group_index: HashMap<GroupKey, usize> = HashMap::new();
@@ -1287,9 +1327,9 @@ impl DatabaseManager {
 
         for item in scan_iter {
             let (_rid, record) = item?;
-            let matches = match &clause.where_clauses {
-                clauses if clauses.is_empty() => true,
-                clauses => self.evaluate_where(&record, schema, clauses)?,
+            let matches = match &prepared_where {
+                None => true,
+                Some(clauses) => self.evaluate_prepared_where(&record, schema, clauses)?,
             };
 
             if !matches {
@@ -1299,7 +1339,9 @@ impl DatabaseManager {
             if let Some(group_idx) = group_by_idx {
                 let value = record
                     .get(group_idx)
-                    .ok_or_else(|| DatabaseError::TypeMismatch("Invalid GROUP BY column".to_string()))?
+                    .ok_or_else(|| {
+                        DatabaseError::TypeMismatch("Invalid GROUP BY column".to_string())
+                    })?
                     .clone();
                 let key = self.group_key_from_value(&value);
                 let entry_idx = match group_index.get(&key) {
@@ -1323,12 +1365,7 @@ impl DatabaseManager {
 
         let mut rows = Vec::new();
         if let Some(state) = agg_state {
-            rows.push(self.build_aggregate_row(
-                None,
-                &output_selectors,
-                &agg_specs,
-                &state,
-            )?);
+            rows.push(self.build_aggregate_row(None, &output_selectors, &agg_specs, &state)?);
         } else {
             for group in &group_states {
                 rows.push(self.build_aggregate_row(
@@ -1436,11 +1473,15 @@ impl DatabaseManager {
                 }
             }
             AggSpec::Sum { col_idx, numeric } => {
-                let value = record.get(*col_idx).ok_or_else(|| {
-                    DatabaseError::TypeMismatch("Invalid SUM column".to_string())
-                })?;
+                let value = record
+                    .get(*col_idx)
+                    .ok_or_else(|| DatabaseError::TypeMismatch("Invalid SUM column".to_string()))?;
                 match (numeric, value, state) {
-                    (NumericType::Int, RecordValue::Int(v), AggState::SumInt { sum, has_value }) => {
+                    (
+                        NumericType::Int,
+                        RecordValue::Int(v),
+                        AggState::SumInt { sum, has_value },
+                    ) => {
                         *sum += *v as i64;
                         *has_value = true;
                     }
@@ -1452,7 +1493,11 @@ impl DatabaseManager {
                         *sum += *v;
                         *has_value = true;
                     }
-                    (NumericType::Float, RecordValue::Int(v), AggState::SumFloat { sum, has_value }) => {
+                    (
+                        NumericType::Float,
+                        RecordValue::Int(v),
+                        AggState::SumFloat { sum, has_value },
+                    ) => {
                         *sum += *v as f64;
                         *has_value = true;
                     }
@@ -1465,9 +1510,9 @@ impl DatabaseManager {
                 }
             }
             AggSpec::Avg { col_idx } => {
-                let value = record.get(*col_idx).ok_or_else(|| {
-                    DatabaseError::TypeMismatch("Invalid AVG column".to_string())
-                })?;
+                let value = record
+                    .get(*col_idx)
+                    .ok_or_else(|| DatabaseError::TypeMismatch("Invalid AVG column".to_string()))?;
                 if let AggState::Avg { sum, count } = state {
                     match value {
                         RecordValue::Int(v) => {
@@ -1488,9 +1533,9 @@ impl DatabaseManager {
                 }
             }
             AggSpec::Min { col_idx } => {
-                let value = record.get(*col_idx).ok_or_else(|| {
-                    DatabaseError::TypeMismatch("Invalid MIN column".to_string())
-                })?;
+                let value = record
+                    .get(*col_idx)
+                    .ok_or_else(|| DatabaseError::TypeMismatch("Invalid MIN column".to_string()))?;
                 if matches!(value, RecordValue::Null) {
                     return Ok(());
                 }
@@ -1506,9 +1551,9 @@ impl DatabaseManager {
                 }
             }
             AggSpec::Max { col_idx } => {
-                let value = record.get(*col_idx).ok_or_else(|| {
-                    DatabaseError::TypeMismatch("Invalid MAX column".to_string())
-                })?;
+                let value = record
+                    .get(*col_idx)
+                    .ok_or_else(|| DatabaseError::TypeMismatch("Invalid MAX column".to_string()))?;
                 if matches!(value, RecordValue::Null) {
                     return Ok(());
                 }
@@ -1562,7 +1607,13 @@ impl DatabaseManager {
         match (spec, state) {
             (AggSpec::CountAll, AggState::Count(count))
             | (AggSpec::Count { .. }, AggState::Count(count)) => count.to_string(),
-            (AggSpec::Sum { numeric: NumericType::Int, .. }, AggState::SumInt { sum, has_value }) => {
+            (
+                AggSpec::Sum {
+                    numeric: NumericType::Int,
+                    ..
+                },
+                AggState::SumInt { sum, has_value },
+            ) => {
                 if *has_value {
                     sum.to_string()
                 } else {
@@ -1590,9 +1641,9 @@ impl DatabaseManager {
                 }
             }
             (AggSpec::Min { .. }, AggState::Min(value))
-            | (AggSpec::Max { .. }, AggState::Max(value)) => {
-                value.as_ref().map_or_else(|| "NULL".to_string(), |v| self.format_value(v))
-            }
+            | (AggSpec::Max { .. }, AggState::Max(value)) => value
+                .as_ref()
+                .map_or_else(|| "NULL".to_string(), |v| self.format_value(v)),
             _ => "NULL".to_string(),
         }
     }
@@ -1798,13 +1849,8 @@ impl DatabaseManager {
 
                 // Insert batch when it reaches BATCH_SIZE
                 if batch_rows.len() >= BATCH_SIZE {
-                    total_inserted += self.bulk_insert(
-                        table,
-                        std::mem::take(&mut batch_rows),
-                        true,
-                        true,
-                        true,
-                    )?;
+                    total_inserted +=
+                        self.bulk_insert(table, std::mem::take(&mut batch_rows), true, true, true)?;
                     batch_rows.reserve(BATCH_SIZE); // Prepare for next batch
 
                     // Flush and clear buffer pool periodically to prevent memory buildup
@@ -1938,10 +1984,7 @@ impl DatabaseManager {
             if col_type != ref_type {
                 return Err(DatabaseError::TypeMismatch(format!(
                     "Foreign key column type mismatch: {}.{} vs {}.{}",
-                    table_meta.name,
-                    fk.columns[pos],
-                    fk.ref_table,
-                    fk.ref_columns[pos]
+                    table_meta.name, fk.columns[pos], fk.ref_table, fk.ref_columns[pos]
                 )));
             }
         }
@@ -2050,11 +2093,7 @@ impl DatabaseManager {
 
         for fk in fk_checks {
             if let Some(indices) = update_indices {
-                if !fk
-                    .column_indices
-                    .iter()
-                    .any(|idx| indices.contains(idx))
-                {
+                if !fk.column_indices.iter().any(|idx| indices.contains(idx)) {
                     continue;
                 }
             }
@@ -2080,7 +2119,7 @@ impl DatabaseManager {
                     _ => {
                         return Err(DatabaseError::TypeMismatch(
                             "Foreign key column must be INT".to_string(),
-                        ))
+                        ));
                     }
                 };
 
@@ -2165,10 +2204,7 @@ impl DatabaseManager {
                         .iter()
                         .position(|c| &c.name == col_name)
                         .ok_or_else(|| {
-                            DatabaseError::ColumnNotFound(
-                                col_name.clone(),
-                                child_meta.name.clone(),
-                            )
+                            DatabaseError::ColumnNotFound(col_name.clone(), child_meta.name.clone())
                         })?;
                     child_column_indices.push(idx);
                 }
@@ -2198,10 +2234,7 @@ impl DatabaseManager {
                     if child_type != parent_type {
                         return Err(DatabaseError::TypeMismatch(format!(
                             "Foreign key column type mismatch: {}.{} vs {}.{}",
-                            child_meta.name,
-                            fk.columns[pos],
-                            parent_meta.name,
-                            fk.ref_columns[pos]
+                            child_meta.name, fk.columns[pos], parent_meta.name, fk.ref_columns[pos]
                         )));
                     }
                 }
@@ -2251,7 +2284,7 @@ impl DatabaseManager {
                     _ => {
                         return Err(DatabaseError::TypeMismatch(
                             "Foreign key column must be INT".to_string(),
-                        ))
+                        ));
                     }
                 };
 
@@ -2466,16 +2499,53 @@ impl DatabaseManager {
         }
     }
 
-    fn evaluate_where(
+    fn prepare_where_clauses(
+        &self,
+        where_clauses: &[WhereClause],
+    ) -> DatabaseResult<Vec<PreparedWhereClause>> {
+        let mut prepared = Vec::with_capacity(where_clauses.len());
+        for clause in where_clauses {
+            match clause {
+                WhereClause::Op(col, op, expr) => {
+                    prepared.push(PreparedWhereClause::Op(
+                        col.clone(),
+                        op.clone(),
+                        expr.clone(),
+                    ));
+                }
+                WhereClause::Null(col) => {
+                    prepared.push(PreparedWhereClause::Null(col.clone()));
+                }
+                WhereClause::NotNull(col) => {
+                    prepared.push(PreparedWhereClause::NotNull(col.clone()));
+                }
+                WhereClause::Like(col, pattern) => {
+                    let regex =
+                        Regex::new(&self.like_pattern_to_regex(pattern)).map_err(|err| {
+                            DatabaseError::TypeMismatch(format!("Invalid LIKE pattern: {}", err))
+                        })?;
+                    prepared.push(PreparedWhereClause::Like(col.clone(), regex));
+                }
+                _ => {
+                    return Err(DatabaseError::TypeMismatch(
+                        "WHERE clause type not yet supported".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(prepared)
+    }
+
+    fn evaluate_prepared_where(
         &self,
         record: &Record,
         schema: &TableSchema,
-        where_clauses: &[WhereClause],
+        where_clauses: &[PreparedWhereClause],
     ) -> DatabaseResult<bool> {
         // All clauses must be true (AND logic)
         for clause in where_clauses {
             match clause {
-                WhereClause::Op(col, op, expr) => {
+                PreparedWhereClause::Op(col, op, expr) => {
                     let col_idx = self.resolve_single_column_index(schema, col)?;
 
                     let left_val = record.get(col_idx).unwrap();
@@ -2496,22 +2566,28 @@ impl DatabaseManager {
                         return Ok(false);
                     }
                 }
-                WhereClause::Null(col) => {
+                PreparedWhereClause::Null(col) => {
                     let col_idx = self.resolve_single_column_index(schema, col)?;
                     if !record.get(col_idx).unwrap().is_null() {
                         return Ok(false);
                     }
                 }
-                WhereClause::NotNull(col) => {
+                PreparedWhereClause::NotNull(col) => {
                     let col_idx = self.resolve_single_column_index(schema, col)?;
                     if record.get(col_idx).unwrap().is_null() {
                         return Ok(false);
                     }
                 }
-                _ => {
-                    return Err(DatabaseError::TypeMismatch(
-                        "WHERE clause type not yet supported".to_string(),
-                    ));
+                PreparedWhereClause::Like(col, regex) => {
+                    let col_idx = self.resolve_single_column_index(schema, col)?;
+                    let value = record.get(col_idx).unwrap();
+                    let matches = match value {
+                        RecordValue::String(s) => regex.is_match(s),
+                        _ => false,
+                    };
+                    if !matches {
+                        return Ok(false);
+                    }
                 }
             }
         }
@@ -2529,13 +2605,8 @@ impl DatabaseManager {
         right_schema: &'a TableSchema,
         right_name: &str,
     ) -> DatabaseResult<(&'a RecordValue, &'a DataType)> {
-        let col_ref = self.resolve_join_column_ref(
-            column,
-            left_name,
-            left_schema,
-            right_name,
-            right_schema,
-        )?;
+        let col_ref =
+            self.resolve_join_column_ref(column, left_name, left_schema, right_name, right_schema)?;
 
         let (record, schema) = match col_ref.side {
             JoinSide::Left => (left_record, left_schema),
@@ -2547,7 +2618,7 @@ impl DatabaseManager {
         Ok((value, data_type))
     }
 
-    fn evaluate_join_where(
+    fn evaluate_prepared_join_where(
         &self,
         left_record: &Record,
         left_schema: &TableSchema,
@@ -2555,11 +2626,11 @@ impl DatabaseManager {
         right_record: &Record,
         right_schema: &TableSchema,
         right_name: &str,
-        where_clauses: &[WhereClause],
+        where_clauses: &[PreparedWhereClause],
     ) -> DatabaseResult<bool> {
         for clause in where_clauses {
             match clause {
-                WhereClause::Op(col, op, expr) => {
+                PreparedWhereClause::Op(col, op, expr) => {
                     let (left_val, data_type) = self.join_value_and_type(
                         col,
                         left_record,
@@ -2590,7 +2661,7 @@ impl DatabaseManager {
                         return Ok(false);
                     }
                 }
-                WhereClause::Null(col) => {
+                PreparedWhereClause::Null(col) => {
                     let (value, _) = self.join_value_and_type(
                         col,
                         left_record,
@@ -2604,7 +2675,7 @@ impl DatabaseManager {
                         return Ok(false);
                     }
                 }
-                WhereClause::NotNull(col) => {
+                PreparedWhereClause::NotNull(col) => {
                     let (value, _) = self.join_value_and_type(
                         col,
                         left_record,
@@ -2615,6 +2686,24 @@ impl DatabaseManager {
                         right_name,
                     )?;
                     if value.is_null() {
+                        return Ok(false);
+                    }
+                }
+                PreparedWhereClause::Like(col, regex) => {
+                    let (value, _) = self.join_value_and_type(
+                        col,
+                        left_record,
+                        left_schema,
+                        left_name,
+                        right_record,
+                        right_schema,
+                        right_name,
+                    )?;
+                    let matches = match value {
+                        RecordValue::String(s) => regex.is_match(s),
+                        _ => false,
+                    };
+                    if !matches {
                         return Ok(false);
                     }
                 }
@@ -2660,6 +2749,25 @@ impl DatabaseManager {
             Operator::Gt => cmp == Ordering::Greater,
             Operator::Ge => cmp != Ordering::Less,
         }
+    }
+
+    fn like_pattern_to_regex(&self, pattern: &str) -> String {
+        let mut regex = String::with_capacity(pattern.len() * 2 + 2);
+        regex.push('^');
+        for ch in pattern.chars() {
+            match ch {
+                '%' => regex.push_str(".*"),
+                '_' => regex.push('.'),
+                '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
+                | '\\' => {
+                    regex.push('\\');
+                    regex.push(ch);
+                }
+                _ => regex.push(ch),
+            }
+        }
+        regex.push('$');
+        regex
     }
 
     fn format_value(&self, value: &RecordValue) -> String {
@@ -2739,10 +2847,7 @@ impl DatabaseManager {
         }
     }
 
-    pub fn execute_alter_statement(
-        &mut self,
-        stmt: AlterStatement,
-    ) -> DatabaseResult<QueryResult> {
+    pub fn execute_alter_statement(&mut self, stmt: AlterStatement) -> DatabaseResult<QueryResult> {
         match stmt {
             AlterStatement::AddIndex(table_name, index_name, columns) => {
                 if columns.len() != 1 {
@@ -2798,10 +2903,8 @@ impl DatabaseManager {
                 let db_path_str = db_path.to_string_lossy().to_string();
 
                 let table_path = self.table_path(db_name, &table_name);
-                self.record_manager.open_table(
-                    &table_path.to_string_lossy().to_string(),
-                    schema.clone(),
-                )?;
+                self.record_manager
+                    .open_table(&table_path.to_string_lossy().to_string(), schema.clone())?;
 
                 let scan_iter = self.record_manager.scan_iter(&table_name)?;
                 let table_iter = TableIntColumnIter::new(scan_iter, col_idx);
@@ -2842,10 +2945,7 @@ impl DatabaseManager {
                         .iter()
                         .position(|idx| idx.name == index_name)
                         .ok_or_else(|| {
-                            DatabaseError::TypeMismatch(format!(
-                                "Index {} not found",
-                                index_name
-                            ))
+                            DatabaseError::TypeMismatch(format!("Index {} not found", index_name))
                         })?;
 
                     let index_meta = table_meta.indexes.remove(pos);
@@ -2888,10 +2988,7 @@ impl DatabaseManager {
                             .iter()
                             .position(|c| &c.name == col_name)
                             .ok_or_else(|| {
-                                DatabaseError::ColumnNotFound(
-                                    col_name.clone(),
-                                    table_name.clone(),
-                                )
+                                DatabaseError::ColumnNotFound(col_name.clone(), table_name.clone())
                             })?;
                         indices.push(idx);
                     }
@@ -2973,11 +3070,7 @@ impl DatabaseManager {
                         .ok_or(DatabaseError::NoDatabaseSelected)?;
                     let table_meta = metadata.get_table(&table_name)?.clone();
 
-                    if table_meta
-                        .foreign_keys
-                        .iter()
-                        .any(|fk| fk.name == fk_name)
-                    {
+                    if table_meta.foreign_keys.iter().any(|fk| fk.name == fk_name) {
                         return Err(DatabaseError::TypeMismatch(format!(
                             "Foreign key {} already exists",
                             fk_name
@@ -3028,10 +3121,7 @@ impl DatabaseManager {
                     .iter()
                     .position(|fk| fk.name == fk_name)
                     .ok_or_else(|| {
-                        DatabaseError::TypeMismatch(format!(
-                            "Foreign key {} not found",
-                            fk_name
-                        ))
+                        DatabaseError::TypeMismatch(format!("Foreign key {} not found", fk_name))
                     })?;
                 table_meta.foreign_keys.remove(pos);
                 self.save_current_metadata()?;

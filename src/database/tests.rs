@@ -548,6 +548,67 @@ fn test_select_with_where() {
 }
 
 #[test]
+fn test_select_with_like() {
+    let (_temp, mut db_manager) = setup_test_db();
+
+    db_manager.create_database("testdb").unwrap();
+    db_manager.use_database("testdb").unwrap();
+
+    let fields = vec![
+        CreateTableField::Col("id".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Col(
+            "name".to_string(),
+            ColumnType::Char(10),
+            true,
+            ParserValue::Null,
+        ),
+    ];
+
+    db_manager.create_table("test", fields).unwrap();
+
+    let rows = vec![
+        vec![
+            ParserValue::Integer(1),
+            ParserValue::String("hello".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(2),
+            ParserValue::String("help".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(3),
+            ParserValue::String("shell".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(4),
+            ParserValue::String("world".to_string()),
+        ],
+    ];
+    db_manager.insert("test", rows).unwrap();
+
+    let clause = SelectClause {
+        selectors: Selectors::All,
+        table: vec!["test".to_string()],
+        where_clauses: vec![WhereClause::Like(
+            crate::lexer_parser::TableColumn {
+                table: None,
+                column: "name".to_string(),
+            },
+            "he%".to_string(),
+        )],
+        group_by: None,
+        order_by: None,
+        limit: None,
+        offset: None,
+    };
+
+    let (_, rows) = db_manager.select(clause).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1], "hello");
+    assert_eq!(rows[1][1], "help");
+}
+
+#[test]
 fn test_select_with_multiple_where() {
     let (_temp, mut db_manager) = setup_test_db();
 
