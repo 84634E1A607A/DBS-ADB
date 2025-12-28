@@ -625,6 +625,73 @@ fn test_composite_index_select_update_delete() {
 }
 
 #[test]
+fn test_composite_index_partial_range() {
+    let (_temp, mut db_manager) = setup_test_db();
+
+    db_manager.create_database("testdb").unwrap();
+    db_manager.use_database("testdb").unwrap();
+
+    let fields = vec![
+        CreateTableField::Col("a".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Col("b".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Col("c".to_string(), ColumnType::Int, false, ParserValue::Null),
+    ];
+    db_manager.create_table("tcomp2", fields).unwrap();
+
+    let rows = vec![
+        vec![
+            ParserValue::Integer(1),
+            ParserValue::Integer(10),
+            ParserValue::Integer(100),
+        ],
+        vec![
+            ParserValue::Integer(1),
+            ParserValue::Integer(20),
+            ParserValue::Integer(200),
+        ],
+        vec![
+            ParserValue::Integer(2),
+            ParserValue::Integer(10),
+            ParserValue::Integer(300),
+        ],
+    ];
+    db_manager.insert("tcomp2", rows).unwrap();
+
+    db_manager
+        .execute_alter_statement(AlterStatement::AddIndex(
+            "tcomp2".to_string(),
+            None,
+            vec!["a".to_string(), "b".to_string()],
+        ))
+        .unwrap();
+
+    let clause = SelectClause {
+        selectors: Selectors::All,
+        table: vec!["tcomp2".to_string()],
+        where_clauses: vec![WhereClause::Op(
+            TableColumn {
+                table: None,
+                column: "a".to_string(),
+            },
+            Operator::Lt,
+            Expression::Value(ParserValue::Integer(2)),
+        )],
+        group_by: None,
+        order_by: None,
+        limit: None,
+        offset: None,
+    };
+    let (_headers, rows) = db_manager.select(clause).unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1", "10", "100"],
+            vec!["1", "20", "200"],
+        ]
+    );
+}
+
+#[test]
 fn test_select_specific_columns() {
     let (_temp, mut db_manager) = setup_test_db();
 

@@ -1801,7 +1801,7 @@ impl DatabaseManager {
             }
         }
 
-        for columns in composite_defs {
+        for columns in &composite_defs {
             let left_val = match eq_values.get(&columns[0]) {
                 Some(val) => *val,
                 None => continue,
@@ -1810,7 +1810,7 @@ impl DatabaseManager {
                 Some(val) => *val,
                 None => continue,
             };
-            let storage_name = match Self::index_storage_name(&columns) {
+            let storage_name = match Self::index_storage_name(columns) {
                 Some(name) => name,
                 None => continue,
             };
@@ -1826,6 +1826,79 @@ impl DatabaseManager {
             let mut rids = self
                 .index_manager
                 .search_all(table_name, &storage_name, key);
+            rids.sort_by_key(|rid| (rid.page_id, rid.slot_id));
+            return Ok(Some(rids));
+        }
+
+        for columns in &composite_defs {
+            let mut lower = None;
+            let mut upper = None;
+            for clause in where_clauses {
+                if let WhereClause::Op(
+                    col,
+                    op,
+                    Expression::Value(ParserValue::Integer(value)),
+                ) = clause
+                {
+                    if col.column != columns[0] || !self.table_column_matches(table_name, col) {
+                        continue;
+                    }
+                    match op {
+                        Operator::Eq => {
+                            lower = Some(*value);
+                            upper = Some(*value);
+                        }
+                        Operator::Gt => {
+                            let bound = value.saturating_add(1);
+                            lower = Some(lower.map_or(bound, |v| v.max(bound)));
+                        }
+                        Operator::Ge => {
+                            lower = Some(lower.map_or(*value, |v| v.max(*value)));
+                        }
+                        Operator::Lt => {
+                            let bound = value.saturating_sub(1);
+                            upper = Some(upper.map_or(bound, |v| v.min(bound)));
+                        }
+                        Operator::Le => {
+                            upper = Some(upper.map_or(*value, |v| v.min(*value)));
+                        }
+                        Operator::Ne => {}
+                    }
+                }
+            }
+
+            if lower.is_none() && upper.is_none() {
+                continue;
+            }
+
+            let storage_name = match Self::index_storage_name(columns) {
+                Some(name) => name,
+                None => continue,
+            };
+            match self
+                .index_manager
+                .open_index(db_path, table_name, &storage_name)
+            {
+                Ok(()) => {}
+                Err(IndexError::IndexNotFound(_)) => continue,
+                Err(err) => return Err(DatabaseError::IndexError(err)),
+            }
+
+            let left_min = lower.unwrap_or(0).clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+            let left_max = upper
+                .unwrap_or(i64::from(i32::MAX))
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+            if left_min > left_max {
+                return Ok(Some(Vec::new()));
+            }
+            let lower_key = TableCompositeIntColumnIter::composite_key(left_min as i32, 0);
+            let upper_key = TableCompositeIntColumnIter::composite_key(left_max as i32, -1);
+            let mut rids = self
+                .index_manager
+                .range_search(table_name, &storage_name, lower_key, upper_key)
+                .into_iter()
+                .map(|(_key, rid)| rid)
+                .collect::<Vec<_>>();
             rids.sort_by_key(|rid| (rid.page_id, rid.slot_id));
             return Ok(Some(rids));
         }
