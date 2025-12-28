@@ -220,6 +220,150 @@ fn test_insert_and_select() {
 }
 
 #[test]
+fn test_select_aggregate_no_group() {
+    let (_temp, mut db_manager) = setup_test_db();
+
+    db_manager.create_database("testdb").unwrap();
+    db_manager.use_database("testdb").unwrap();
+
+    let fields = vec![
+        CreateTableField::Col("a".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Col("b".to_string(), ColumnType::Float, false, ParserValue::Null),
+        CreateTableField::Col(
+            "c".to_string(),
+            ColumnType::Char(10),
+            false,
+            ParserValue::Null,
+        ),
+    ];
+    db_manager.create_table("t", fields).unwrap();
+
+    let rows = vec![
+        vec![
+            ParserValue::Integer(1),
+            ParserValue::Float(1.0),
+            ParserValue::String("x".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(2),
+            ParserValue::Float(3.5),
+            ParserValue::String("y".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(3),
+            ParserValue::Null,
+            ParserValue::String("z".to_string()),
+        ],
+    ];
+    db_manager.insert("t", rows).unwrap();
+
+    let clause = SelectClause {
+        selectors: Selectors::List(vec![
+            Selector::Min(TableColumn {
+                table: None,
+                column: "a".to_string(),
+            }),
+            Selector::Max(TableColumn {
+                table: None,
+                column: "b".to_string(),
+            }),
+            Selector::Sum(TableColumn {
+                table: None,
+                column: "a".to_string(),
+            }),
+            Selector::CountAll,
+        ]),
+        table: vec!["t".to_string()],
+        where_clauses: vec![],
+        group_by: None,
+        order_by: None,
+        limit: None,
+        offset: None,
+    };
+
+    let (headers, rows) = db_manager.select(clause).unwrap();
+    assert_eq!(headers, vec!["MIN(a)", "MAX(b)", "SUM(a)", "COUNT(*)"]);
+    assert_eq!(rows, vec![vec!["1", "3.50", "6", "3"]]);
+}
+
+#[test]
+fn test_select_aggregate_group_by() {
+    let (_temp, mut db_manager) = setup_test_db();
+
+    db_manager.create_database("testdb").unwrap();
+    db_manager.use_database("testdb").unwrap();
+
+    let fields = vec![
+        CreateTableField::Col("a".to_string(), ColumnType::Int, true, ParserValue::Null),
+        CreateTableField::Col("b".to_string(), ColumnType::Float, false, ParserValue::Null),
+        CreateTableField::Col(
+            "c".to_string(),
+            ColumnType::Char(10),
+            false,
+            ParserValue::Null,
+        ),
+    ];
+    db_manager.create_table("t", fields).unwrap();
+
+    let rows = vec![
+        vec![
+            ParserValue::Integer(1),
+            ParserValue::Float(1.0),
+            ParserValue::String("x".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(2),
+            ParserValue::Float(3.0),
+            ParserValue::String("x".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(3),
+            ParserValue::Float(5.0),
+            ParserValue::String("y".to_string()),
+        ],
+        vec![
+            ParserValue::Integer(4),
+            ParserValue::Null,
+            ParserValue::String("y".to_string()),
+        ],
+    ];
+    db_manager.insert("t", rows).unwrap();
+
+    let clause = SelectClause {
+        selectors: Selectors::List(vec![
+            Selector::Column(TableColumn {
+                table: None,
+                column: "c".to_string(),
+            }),
+            Selector::CountAll,
+            Selector::Average(TableColumn {
+                table: None,
+                column: "b".to_string(),
+            }),
+        ]),
+        table: vec!["t".to_string()],
+        where_clauses: vec![],
+        group_by: Some(TableColumn {
+            table: None,
+            column: "c".to_string(),
+        }),
+        order_by: None,
+        limit: None,
+        offset: None,
+    };
+
+    let (headers, rows) = db_manager.select(clause).unwrap();
+    assert_eq!(headers, vec!["c", "COUNT(*)", "AVG(b)"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec!["x".to_string(), "2".to_string(), "2.00".to_string()],
+            vec!["y".to_string(), "2".to_string(), "5.00".to_string()],
+        ]
+    );
+}
+
+#[test]
 fn test_add_and_drop_index() {
     let (temp_dir, mut db_manager) = setup_test_db();
 

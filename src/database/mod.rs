@@ -1,4 +1,5 @@
 use csv::ReaderBuilder;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -113,6 +114,52 @@ impl Iterator for TableIntColumnIter {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum GroupKey {
+    Int(i32),
+    Float(u64),
+    String(String),
+    Null,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NumericType {
+    Int,
+    Float,
+}
+
+#[derive(Debug, Clone)]
+enum AggSpec {
+    CountAll,
+    Count { col_idx: usize },
+    Sum { col_idx: usize, numeric: NumericType },
+    Avg { col_idx: usize },
+    Min { col_idx: usize },
+    Max { col_idx: usize },
+}
+
+#[derive(Debug, Clone)]
+enum AggState {
+    Count(i64),
+    SumInt { sum: i64, has_value: bool },
+    SumFloat { sum: f64, has_value: bool },
+    Avg { sum: f64, count: i64 },
+    Min(Option<RecordValue>),
+    Max(Option<RecordValue>),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OutputSelector {
+    GroupKey,
+    Agg(usize),
+}
+
+#[derive(Debug, Clone)]
+struct GroupState {
+    key: RecordValue,
+    aggs: Vec<AggState>,
 }
 
 struct ForeignKeyCheck {
@@ -855,6 +902,10 @@ impl DatabaseManager {
         self.record_manager
             .open_table(&table_path_str, schema.clone())?;
 
+        if self.select_has_aggregate(&clause.selectors) || clause.group_by.is_some() {
+            return self.select_single_table_aggregate(&clause, &schema, table_name);
+        }
+
         let (selected_columns, col_indices) = match &clause.selectors {
             Selectors::All => {
                 let columns = schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -912,6 +963,12 @@ impl DatabaseManager {
         &mut self,
         clause: SelectClause,
     ) -> DatabaseResult<(Vec<String>, Vec<Vec<String>>)> {
+        if self.select_has_aggregate(&clause.selectors) || clause.group_by.is_some() {
+            return Err(DatabaseError::TypeMismatch(
+                "Aggregates are not supported with joins".to_string(),
+            ));
+        }
+
         let (left_name, right_name) = (&clause.table[0], &clause.table[1]);
 
         let (left_meta, right_meta) = {
@@ -1026,6 +1083,446 @@ impl DatabaseManager {
         }
 
         Ok((selected_columns, result_rows))
+    }
+
+    fn select_has_aggregate(&self, selectors: &Selectors) -> bool {
+        match selectors {
+            Selectors::All => false,
+            Selectors::List(list) => list.iter().any(|selector| {
+                !matches!(selector, Selector::Column(_))
+            }),
+        }
+    }
+
+    fn select_single_table_aggregate(
+        &mut self,
+        clause: &SelectClause,
+        schema: &TableSchema,
+        table_name: &str,
+    ) -> DatabaseResult<(Vec<String>, Vec<Vec<String>>)> {
+        let selectors = match &clause.selectors {
+            Selectors::All => {
+                return Err(DatabaseError::TypeMismatch(
+                    "SELECT * is not supported with aggregates".to_string(),
+                ));
+            }
+            Selectors::List(list) => list,
+        };
+
+        let group_by_idx = match &clause.group_by {
+            Some(tc) => Some(self.resolve_single_column_index(schema, tc)?),
+            None => None,
+        };
+
+        let mut headers = Vec::new();
+        let mut output_selectors = Vec::new();
+        let mut agg_specs = Vec::new();
+
+        for selector in selectors {
+            match selector {
+                Selector::Column(tc) => {
+                    let col_idx = self.resolve_single_column_index(schema, tc)?;
+                    match group_by_idx {
+                        Some(group_idx) if group_idx == col_idx => {
+                            headers.push(tc.column.clone());
+                            output_selectors.push(OutputSelector::GroupKey);
+                        }
+                        Some(_) => {
+                            return Err(DatabaseError::TypeMismatch(
+                                "Non-aggregate column must match GROUP BY".to_string(),
+                            ));
+                        }
+                        None => {
+                            return Err(DatabaseError::TypeMismatch(
+                                "Non-aggregate column requires GROUP BY".to_string(),
+                            ));
+                        }
+                    }
+                }
+                Selector::CountAll => {
+                    headers.push("COUNT(*)".to_string());
+                    agg_specs.push(AggSpec::CountAll);
+                    output_selectors.push(OutputSelector::Agg(agg_specs.len() - 1));
+                }
+                Selector::Count(tc) => {
+                    let col_idx = self.resolve_single_column_index(schema, tc)?;
+                    headers.push(format!("COUNT({})", self.format_table_column_name(tc)));
+                    agg_specs.push(AggSpec::Count { col_idx });
+                    output_selectors.push(OutputSelector::Agg(agg_specs.len() - 1));
+                }
+                Selector::Average(tc) => {
+                    let col_idx = self.resolve_single_column_index(schema, tc)?;
+                    self.ensure_numeric_column(schema, col_idx)?;
+                    headers.push(format!("AVG({})", self.format_table_column_name(tc)));
+                    agg_specs.push(AggSpec::Avg { col_idx });
+                    output_selectors.push(OutputSelector::Agg(agg_specs.len() - 1));
+                }
+                Selector::Max(tc) => {
+                    let col_idx = self.resolve_single_column_index(schema, tc)?;
+                    headers.push(format!("MAX({})", self.format_table_column_name(tc)));
+                    agg_specs.push(AggSpec::Max { col_idx });
+                    output_selectors.push(OutputSelector::Agg(agg_specs.len() - 1));
+                }
+                Selector::Min(tc) => {
+                    let col_idx = self.resolve_single_column_index(schema, tc)?;
+                    headers.push(format!("MIN({})", self.format_table_column_name(tc)));
+                    agg_specs.push(AggSpec::Min { col_idx });
+                    output_selectors.push(OutputSelector::Agg(agg_specs.len() - 1));
+                }
+                Selector::Sum(tc) => {
+                    let col_idx = self.resolve_single_column_index(schema, tc)?;
+                    let numeric = self.numeric_type_for_column(schema, col_idx)?;
+                    headers.push(format!("SUM({})", self.format_table_column_name(tc)));
+                    agg_specs.push(AggSpec::Sum { col_idx, numeric });
+                    output_selectors.push(OutputSelector::Agg(agg_specs.len() - 1));
+                }
+            }
+        }
+
+        let scan_iter = self.record_manager.scan_iter(table_name)?;
+
+        let mut group_states = Vec::new();
+        let mut group_index: HashMap<GroupKey, usize> = HashMap::new();
+        let mut agg_state = if group_by_idx.is_none() {
+            Some(self.init_agg_states(&agg_specs))
+        } else {
+            None
+        };
+
+        for item in scan_iter {
+            let (_rid, record) = item?;
+            let matches = match &clause.where_clauses {
+                clauses if clauses.is_empty() => true,
+                clauses => self.evaluate_where(&record, schema, clauses)?,
+            };
+
+            if !matches {
+                continue;
+            }
+
+            if let Some(group_idx) = group_by_idx {
+                let value = record
+                    .get(group_idx)
+                    .ok_or_else(|| DatabaseError::TypeMismatch("Invalid GROUP BY column".to_string()))?
+                    .clone();
+                let key = self.group_key_from_value(&value);
+                let entry_idx = match group_index.get(&key) {
+                    Some(idx) => *idx,
+                    None => {
+                        let idx = group_states.len();
+                        group_states.push(GroupState {
+                            key: value,
+                            aggs: self.init_agg_states(&agg_specs),
+                        });
+                        group_index.insert(key, idx);
+                        idx
+                    }
+                };
+                let state = &mut group_states[entry_idx].aggs;
+                self.update_agg_states(state, &agg_specs, &record)?;
+            } else if let Some(state) = agg_state.as_mut() {
+                self.update_agg_states(state, &agg_specs, &record)?;
+            }
+        }
+
+        let mut rows = Vec::new();
+        if let Some(state) = agg_state {
+            rows.push(self.build_aggregate_row(
+                None,
+                &output_selectors,
+                &agg_specs,
+                &state,
+            )?);
+        } else {
+            for group in &group_states {
+                rows.push(self.build_aggregate_row(
+                    Some(&group.key),
+                    &output_selectors,
+                    &agg_specs,
+                    &group.aggs,
+                )?);
+            }
+        }
+
+        Ok((headers, rows))
+    }
+
+    fn format_table_column_name(&self, column: &TableColumn) -> String {
+        match &column.table {
+            Some(table) => format!("{}.{}", table, column.column),
+            None => column.column.clone(),
+        }
+    }
+
+    fn ensure_numeric_column(&self, schema: &TableSchema, col_idx: usize) -> DatabaseResult<()> {
+        match schema.columns[col_idx].data_type {
+            DataType::Int | DataType::Float => Ok(()),
+            _ => Err(DatabaseError::TypeMismatch(
+                "Aggregate requires numeric column".to_string(),
+            )),
+        }
+    }
+
+    fn numeric_type_for_column(
+        &self,
+        schema: &TableSchema,
+        col_idx: usize,
+    ) -> DatabaseResult<NumericType> {
+        match schema.columns[col_idx].data_type {
+            DataType::Int => Ok(NumericType::Int),
+            DataType::Float => Ok(NumericType::Float),
+            _ => Err(DatabaseError::TypeMismatch(
+                "Aggregate requires numeric column".to_string(),
+            )),
+        }
+    }
+
+    fn init_agg_states(&self, specs: &[AggSpec]) -> Vec<AggState> {
+        specs
+            .iter()
+            .map(|spec| match spec {
+                AggSpec::CountAll | AggSpec::Count { .. } => AggState::Count(0),
+                AggSpec::Sum {
+                    numeric: NumericType::Int,
+                    ..
+                } => AggState::SumInt {
+                    sum: 0,
+                    has_value: false,
+                },
+                AggSpec::Sum {
+                    numeric: NumericType::Float,
+                    ..
+                } => AggState::SumFloat {
+                    sum: 0.0,
+                    has_value: false,
+                },
+                AggSpec::Avg { .. } => AggState::Avg { sum: 0.0, count: 0 },
+                AggSpec::Min { .. } => AggState::Min(None),
+                AggSpec::Max { .. } => AggState::Max(None),
+            })
+            .collect()
+    }
+
+    fn update_agg_states(
+        &self,
+        states: &mut [AggState],
+        specs: &[AggSpec],
+        record: &Record,
+    ) -> DatabaseResult<()> {
+        for (state, spec) in states.iter_mut().zip(specs.iter()) {
+            self.update_agg_state(state, spec, record)?;
+        }
+        Ok(())
+    }
+
+    fn update_agg_state(
+        &self,
+        state: &mut AggState,
+        spec: &AggSpec,
+        record: &Record,
+    ) -> DatabaseResult<()> {
+        match spec {
+            AggSpec::CountAll => {
+                if let AggState::Count(count) = state {
+                    *count += 1;
+                }
+            }
+            AggSpec::Count { col_idx } => {
+                let value = record.get(*col_idx).ok_or_else(|| {
+                    DatabaseError::TypeMismatch("Invalid COUNT column".to_string())
+                })?;
+                if !matches!(value, RecordValue::Null) {
+                    if let AggState::Count(count) = state {
+                        *count += 1;
+                    }
+                }
+            }
+            AggSpec::Sum { col_idx, numeric } => {
+                let value = record.get(*col_idx).ok_or_else(|| {
+                    DatabaseError::TypeMismatch("Invalid SUM column".to_string())
+                })?;
+                match (numeric, value, state) {
+                    (NumericType::Int, RecordValue::Int(v), AggState::SumInt { sum, has_value }) => {
+                        *sum += *v as i64;
+                        *has_value = true;
+                    }
+                    (
+                        NumericType::Float,
+                        RecordValue::Float(v),
+                        AggState::SumFloat { sum, has_value },
+                    ) => {
+                        *sum += *v;
+                        *has_value = true;
+                    }
+                    (NumericType::Float, RecordValue::Int(v), AggState::SumFloat { sum, has_value }) => {
+                        *sum += *v as f64;
+                        *has_value = true;
+                    }
+                    (_, RecordValue::Null, _) => {}
+                    _ => {
+                        return Err(DatabaseError::TypeMismatch(
+                            "SUM requires numeric column".to_string(),
+                        ));
+                    }
+                }
+            }
+            AggSpec::Avg { col_idx } => {
+                let value = record.get(*col_idx).ok_or_else(|| {
+                    DatabaseError::TypeMismatch("Invalid AVG column".to_string())
+                })?;
+                if let AggState::Avg { sum, count } = state {
+                    match value {
+                        RecordValue::Int(v) => {
+                            *sum += *v as f64;
+                            *count += 1;
+                        }
+                        RecordValue::Float(v) => {
+                            *sum += *v;
+                            *count += 1;
+                        }
+                        RecordValue::Null => {}
+                        _ => {
+                            return Err(DatabaseError::TypeMismatch(
+                                "AVG requires numeric column".to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+            AggSpec::Min { col_idx } => {
+                let value = record.get(*col_idx).ok_or_else(|| {
+                    DatabaseError::TypeMismatch("Invalid MIN column".to_string())
+                })?;
+                if matches!(value, RecordValue::Null) {
+                    return Ok(());
+                }
+                if let AggState::Min(current) = state {
+                    match current {
+                        None => *current = Some(value.clone()),
+                        Some(existing) => {
+                            if self.compare_record_values(value, existing)? == Ordering::Less {
+                                *current = Some(value.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            AggSpec::Max { col_idx } => {
+                let value = record.get(*col_idx).ok_or_else(|| {
+                    DatabaseError::TypeMismatch("Invalid MAX column".to_string())
+                })?;
+                if matches!(value, RecordValue::Null) {
+                    return Ok(());
+                }
+                if let AggState::Max(current) = state {
+                    match current {
+                        None => *current = Some(value.clone()),
+                        Some(existing) => {
+                            if self.compare_record_values(value, existing)? == Ordering::Greater {
+                                *current = Some(value.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn build_aggregate_row(
+        &self,
+        group_key: Option<&RecordValue>,
+        output_selectors: &[OutputSelector],
+        agg_specs: &[AggSpec],
+        aggs: &[AggState],
+    ) -> DatabaseResult<Vec<String>> {
+        let mut row = Vec::with_capacity(output_selectors.len());
+        for selector in output_selectors {
+            match selector {
+                OutputSelector::GroupKey => {
+                    let value = group_key.ok_or_else(|| {
+                        DatabaseError::TypeMismatch("Missing GROUP BY value".to_string())
+                    })?;
+                    row.push(self.format_value(value));
+                }
+                OutputSelector::Agg(idx) => {
+                    let state = aggs.get(*idx).ok_or_else(|| {
+                        DatabaseError::TypeMismatch("Invalid aggregate selector".to_string())
+                    })?;
+                    let spec = agg_specs.get(*idx).ok_or_else(|| {
+                        DatabaseError::TypeMismatch("Invalid aggregate selector".to_string())
+                    })?;
+                    row.push(self.format_aggregate_value(state, spec));
+                }
+            }
+        }
+        Ok(row)
+    }
+
+    fn format_aggregate_value(&self, state: &AggState, spec: &AggSpec) -> String {
+        match (spec, state) {
+            (AggSpec::CountAll, AggState::Count(count))
+            | (AggSpec::Count { .. }, AggState::Count(count)) => count.to_string(),
+            (AggSpec::Sum { numeric: NumericType::Int, .. }, AggState::SumInt { sum, has_value }) => {
+                if *has_value {
+                    sum.to_string()
+                } else {
+                    "NULL".to_string()
+                }
+            }
+            (
+                AggSpec::Sum {
+                    numeric: NumericType::Float,
+                    ..
+                },
+                AggState::SumFloat { sum, has_value },
+            ) => {
+                if *has_value {
+                    format!("{:.2}", sum)
+                } else {
+                    "NULL".to_string()
+                }
+            }
+            (AggSpec::Avg { .. }, AggState::Avg { sum, count }) => {
+                if *count > 0 {
+                    format!("{:.2}", sum / *count as f64)
+                } else {
+                    "NULL".to_string()
+                }
+            }
+            (AggSpec::Min { .. }, AggState::Min(value))
+            | (AggSpec::Max { .. }, AggState::Max(value)) => {
+                value.as_ref().map_or_else(|| "NULL".to_string(), |v| self.format_value(v))
+            }
+            _ => "NULL".to_string(),
+        }
+    }
+
+    fn group_key_from_value(&self, value: &RecordValue) -> GroupKey {
+        match value {
+            RecordValue::Int(v) => GroupKey::Int(*v),
+            RecordValue::Float(v) => GroupKey::Float(v.to_bits()),
+            RecordValue::String(s) => GroupKey::String(s.clone()),
+            RecordValue::Null => GroupKey::Null,
+        }
+    }
+
+    fn compare_record_values(
+        &self,
+        left: &RecordValue,
+        right: &RecordValue,
+    ) -> DatabaseResult<Ordering> {
+        match (left, right) {
+            (RecordValue::Int(l), RecordValue::Int(r)) => Ok(l.cmp(r)),
+            (RecordValue::Float(l), RecordValue::Float(r)) => l
+                .partial_cmp(r)
+                .ok_or_else(|| DatabaseError::TypeMismatch("Invalid float comparison".to_string())),
+            (RecordValue::String(l), RecordValue::String(r)) => Ok(l.cmp(r)),
+            _ => Err(DatabaseError::TypeMismatch(
+                "Aggregate comparison type mismatch".to_string(),
+            )),
+        }
     }
 
     pub fn load_data_infile(
