@@ -17,6 +17,10 @@ struct Args {
     #[arg(short, long)]
     batch: bool,
 
+    /// Disable index usage and force full table scans
+    #[arg(short = 'n', long)]
+    noindex: bool,
+
     /// Import data from file (must be used with -t/--table)
     #[arg(short, long, value_name = "PATH")]
     file: Option<String>,
@@ -76,6 +80,9 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if args.noindex {
+        db_manager.set_use_indexes(false);
+    }
 
     // If database is specified, execute USE command
     if let Some(db_name) = args.database {

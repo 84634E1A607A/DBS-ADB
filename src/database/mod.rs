@@ -82,6 +82,7 @@ pub struct DatabaseManager {
     buffer_manager: Arc<Mutex<BufferManager>>,
     record_manager: RecordManager,
     index_manager: IndexManager,
+    use_indexes: bool,
 }
 
 struct TableIntColumnIter {
@@ -232,7 +233,12 @@ impl DatabaseManager {
             buffer_manager,
             record_manager,
             index_manager,
+            use_indexes: true,
         })
+    }
+
+    pub fn set_use_indexes(&mut self, use_indexes: bool) {
+        self.use_indexes = use_indexes;
     }
 
     // Database operations
@@ -530,25 +536,28 @@ impl DatabaseManager {
                 let db_path = self.data_dir.join(db_name.as_str());
                 let _index_key = (table.to_string(), pk_col_name.clone());
 
-                // Try to open the index if it exists
-                let has_index = self
-                    .index_manager
-                    .open_index(&db_path.to_string_lossy(), table, pk_col_name)
-                    .is_ok();
-
-                if has_index {
-                    // Use index for fast lookup
-                    for record in &records {
-                        if let RecordValue::Int(pk_val) = record.get(pk_col_idx).unwrap()
-                            && self
-                                .index_manager
-                                .search(table, pk_col_name, *pk_val as i64)
-                                .is_some()
-                        {
-                            return Err(DatabaseError::PrimaryKeyViolation);
+                let mut used_index = false;
+                if self.use_indexes {
+                    let has_index = self
+                        .index_manager
+                        .open_index(&db_path.to_string_lossy(), table, pk_col_name)
+                        .is_ok();
+                    if has_index {
+                        used_index = true;
+                        for record in &records {
+                            if let RecordValue::Int(pk_val) = record.get(pk_col_idx).unwrap()
+                                && self
+                                    .index_manager
+                                    .search(table, pk_col_name, *pk_val as i64)
+                                    .is_some()
+                            {
+                                return Err(DatabaseError::PrimaryKeyViolation);
+                            }
                         }
                     }
-                } else {
+                }
+
+                if !used_index {
                     // Fallback: scan existing records (only once for the whole batch)
                     let existing_records = self.record_manager.scan(table)?;
                     for record in &records {
@@ -656,60 +665,72 @@ impl DatabaseManager {
             .open_table(&table_path_str, schema.clone());
 
         let referencing_checks = self.build_referencing_fk_checks(&table_meta)?;
+        let where_slice: &[WhereClause] = match &where_clauses {
+            Some(clauses) => clauses,
+            None => &[],
+        };
         let prepared_where = match &where_clauses {
             Some(clauses) => Some(self.prepare_where_clauses(clauses)?),
             None => None,
         };
+
+        let indexed_columns = self.open_indexed_columns(&db_path_str, &table_meta)?;
+        let mut deleted = 0;
+        let mut targets = Vec::new();
+        let index_candidates =
+            self.index_candidates_for_where(&db_path_str, table, &schema, where_slice)?;
+        if let Some(rids) = index_candidates {
+            for rid in rids {
+                let record = self.record_manager.get(table, rid)?;
+                let should_delete = match &prepared_where {
+                    None => true,
+                    Some(clauses) => self.evaluate_prepared_where(&record, &schema, clauses)?,
+                };
+                if should_delete {
+                    targets.push((rid, record));
+                }
+            }
+        } else {
+            let scan_iter = self.record_manager.scan_iter(table)?;
+            for item in scan_iter {
+                let (rid, record) = item?;
+                let should_delete = match &prepared_where {
+                    None => true,
+                    Some(clauses) => self.evaluate_prepared_where(&record, &schema, clauses)?,
+                };
+                if should_delete {
+                    targets.push((rid, record));
+                }
+            }
+        }
+
         if !referencing_checks.is_empty() {
             let db_name = self
                 .current_db
                 .clone()
                 .ok_or(DatabaseError::NoDatabaseSelected)?;
-            let scan_iter = self.record_manager.scan_iter(table)?;
-            for item in scan_iter {
-                let (_rid, record) = item?;
-                let should_delete = match &prepared_where {
-                    None => true,
-                    Some(clauses) => self.evaluate_prepared_where(&record, &schema, clauses)?,
-                };
-
-                if should_delete {
-                    self.validate_foreign_keys_on_delete_record(
-                        &db_name,
-                        &db_path_str,
-                        &referencing_checks,
-                        &record,
-                    )?;
-                }
+            for (_rid, record) in &targets {
+                self.validate_foreign_keys_on_delete_record(
+                    &db_name,
+                    &db_path_str,
+                    &referencing_checks,
+                    record,
+                )?;
             }
         }
 
-        let indexed_columns = self.open_indexed_columns(&db_path_str, &table_meta)?;
-        let mut deleted = 0;
-        let scan_iter = self.record_manager.scan_iter(table)?;
-        for item in scan_iter {
-            let (rid, record) = item?;
-            let should_delete = match &prepared_where {
-                None => true,
-                Some(clauses) => self.evaluate_prepared_where(&record, &schema, clauses)?,
-            };
-
-            if should_delete {
-                self.record_manager.delete(table, rid)?;
-                if !indexed_columns.is_empty() {
-                    for (col_name, col_idx) in &indexed_columns {
-                        if let Some(RecordValue::Int(val)) = record.get(*col_idx) {
-                            let _ = self.index_manager.delete_entry(
-                                table,
-                                col_name,
-                                *val as i64,
-                                rid,
-                            )?;
-                        }
+        for (rid, record) in targets {
+            self.record_manager.delete(table, rid)?;
+            if !indexed_columns.is_empty() {
+                for (col_name, col_idx) in &indexed_columns {
+                    if let Some(RecordValue::Int(val)) = record.get(*col_idx) {
+                        let _ = self
+                            .index_manager
+                            .delete_entry(table, col_name, *val as i64, rid)?;
                     }
                 }
-                deleted += 1;
             }
+            deleted += 1;
         }
 
         Ok(deleted)
@@ -777,123 +798,146 @@ impl DatabaseManager {
         } else {
             self.open_indexed_columns(&db_path_str, &table_meta)?
         };
+        let where_slice: &[WhereClause] = match &where_clauses {
+            Some(clauses) => clauses,
+            None => &[],
+        };
         let prepared_where = match &where_clauses {
             Some(clauses) => Some(self.prepare_where_clauses(clauses)?),
             None => None,
         };
         let mut updated = 0;
-        let scan_iter = self.record_manager.scan_iter(table)?;
-        for item in scan_iter {
-            let (rid, mut record) = item?;
-            let should_update = match &prepared_where {
-                None => true,
-                Some(clauses) => self.evaluate_prepared_where(&record, &schema, clauses)?,
-            };
-
-            if should_update {
-                let original = record.clone();
-                // Apply updates
-                for (col_idx, new_value) in &update_map {
-                    let data_type = &schema.columns[*col_idx].data_type;
-                    let record_value = self.parser_value_to_record_value(new_value, data_type);
-                    record.set(*col_idx, record_value);
+        let mut targets = Vec::new();
+        let index_candidates =
+            self.index_candidates_for_where(&db_path_str, table, &schema, where_slice)?;
+        if let Some(rids) = index_candidates {
+            for rid in rids {
+                let record = self.record_manager.get(table, rid)?;
+                let should_update = match &prepared_where {
+                    None => true,
+                    Some(clauses) => self.evaluate_prepared_where(&record, &schema, clauses)?,
+                };
+                if should_update {
+                    targets.push((rid, record));
                 }
+            }
+        } else {
+            let scan_iter = self.record_manager.scan_iter(table)?;
+            for item in scan_iter {
+                let (rid, record) = item?;
+                let should_update = match &prepared_where {
+                    None => true,
+                    Some(clauses) => self.evaluate_prepared_where(&record, &schema, clauses)?,
+                };
+                if should_update {
+                    targets.push((rid, record));
+                }
+            }
+        }
 
-                if should_check_referencing {
-                    let mut changed_fks = Vec::new();
-                    for fk in &referencing_checks {
-                        if !fk
-                            .parent_column_indices
-                            .iter()
-                            .any(|idx| update_indices.contains(idx))
-                        {
-                            continue;
-                        }
-                        let mut changed = false;
-                        for idx in &fk.parent_column_indices {
-                            let old_value = original.get(*idx).unwrap();
-                            let new_value = record.get(*idx).unwrap();
-                            if old_value != new_value {
-                                changed = true;
-                                break;
-                            }
-                        }
-                        if changed {
-                            changed_fks.push(fk.clone());
+        for (rid, mut record) in targets {
+            let original = record.clone();
+            // Apply updates
+            for (col_idx, new_value) in &update_map {
+                let data_type = &schema.columns[*col_idx].data_type;
+                let record_value = self.parser_value_to_record_value(new_value, data_type);
+                record.set(*col_idx, record_value);
+            }
+
+            if should_check_referencing {
+                let mut changed_fks = Vec::new();
+                for fk in &referencing_checks {
+                    if !fk
+                        .parent_column_indices
+                        .iter()
+                        .any(|idx| update_indices.contains(idx))
+                    {
+                        continue;
+                    }
+                    let mut changed = false;
+                    for idx in &fk.parent_column_indices {
+                        let old_value = original.get(*idx).unwrap();
+                        let new_value = record.get(*idx).unwrap();
+                        if old_value != new_value {
+                            changed = true;
+                            break;
                         }
                     }
-
-                    if !changed_fks.is_empty() {
-                        let db_name = self
-                            .current_db
-                            .clone()
-                            .ok_or(DatabaseError::NoDatabaseSelected)?;
-                        self.validate_foreign_keys_on_delete_record(
-                            &db_name,
-                            &db_path_str,
-                            &changed_fks,
-                            &original,
-                        )?;
+                    if changed {
+                        changed_fks.push(fk.clone());
                     }
                 }
 
-                if should_check_fk {
+                if !changed_fks.is_empty() {
                     let db_name = self
                         .current_db
                         .clone()
                         .ok_or(DatabaseError::NoDatabaseSelected)?;
-                    self.validate_foreign_keys_for_record(
+                    self.validate_foreign_keys_on_delete_record(
                         &db_name,
-                        &fk_checks,
-                        &record,
-                        Some(&update_indices),
+                        &db_path_str,
+                        &changed_fks,
+                        &original,
                     )?;
                 }
+            }
 
-                let updated_record = record.clone();
-                self.record_manager.update(table, rid, updated_record)?;
-                if !indexed_columns.is_empty() {
-                    for (col_name, col_idx) in &indexed_columns {
-                        if !update_indices.contains(col_idx) {
-                            continue;
-                        }
-                        let old_val = original.get(*col_idx).unwrap();
-                        let new_val = record.get(*col_idx).unwrap();
-                        match (old_val, new_val) {
-                            (RecordValue::Int(old_key), RecordValue::Int(new_key)) => {
-                                if old_key != new_key {
-                                    let _ = self.index_manager.delete_entry(
-                                        table,
-                                        col_name,
-                                        *old_key as i64,
-                                        rid,
-                                    )?;
-                                    self.index_manager.insert(
-                                        table,
-                                        col_name,
-                                        *new_key as i64,
-                                        rid,
-                                    )?;
-                                }
-                            }
-                            (RecordValue::Int(old_key), _) => {
+            if should_check_fk {
+                let db_name = self
+                    .current_db
+                    .clone()
+                    .ok_or(DatabaseError::NoDatabaseSelected)?;
+                self.validate_foreign_keys_for_record(
+                    &db_name,
+                    &fk_checks,
+                    &record,
+                    Some(&update_indices),
+                )?;
+            }
+
+            let updated_record = record.clone();
+            self.record_manager.update(table, rid, updated_record)?;
+            if !indexed_columns.is_empty() {
+                for (col_name, col_idx) in &indexed_columns {
+                    if !update_indices.contains(col_idx) {
+                        continue;
+                    }
+                    let old_val = original.get(*col_idx).unwrap();
+                    let new_val = record.get(*col_idx).unwrap();
+                    match (old_val, new_val) {
+                        (RecordValue::Int(old_key), RecordValue::Int(new_key)) => {
+                            if old_key != new_key {
                                 let _ = self.index_manager.delete_entry(
                                     table,
                                     col_name,
                                     *old_key as i64,
                                     rid,
                                 )?;
+                                self.index_manager.insert(
+                                    table,
+                                    col_name,
+                                    *new_key as i64,
+                                    rid,
+                                )?;
                             }
-                            (_, RecordValue::Int(new_key)) => {
-                                self.index_manager
-                                    .insert(table, col_name, *new_key as i64, rid)?;
-                            }
-                            _ => {}
                         }
+                        (RecordValue::Int(old_key), _) => {
+                            let _ = self.index_manager.delete_entry(
+                                table,
+                                col_name,
+                                *old_key as i64,
+                                rid,
+                            )?;
+                        }
+                        (_, RecordValue::Int(new_key)) => {
+                            self.index_manager
+                                .insert(table, col_name, *new_key as i64, rid)?;
+                        }
+                        _ => {}
                     }
                 }
-                updated += 1;
             }
+            updated += 1;
         }
 
         Ok(updated)
@@ -926,6 +970,8 @@ impl DatabaseManager {
         let schema = self.metadata_to_schema(table_meta);
 
         let db_name = self.current_db.as_ref().unwrap();
+        let db_path = self.data_dir.join(db_name);
+        let db_path_str = db_path.to_string_lossy();
         let table_path = self.table_path(db_name, table_name);
         let table_path_str = table_path.to_string_lossy().to_string();
 
@@ -975,32 +1021,62 @@ impl DatabaseManager {
             Some(self.prepare_where_clauses(&clause.where_clauses)?)
         };
 
-        // Scan table using streaming iterator
-        let scan_iter = self.record_manager.scan_iter(table_name)?;
-
         let mut result_rows = Vec::new();
         let mut order_rows = Vec::new();
-        for item in scan_iter {
-            let (_rid, record) = item?;
-            // Evaluate WHERE clause
-            let matches = match &prepared_where {
-                None => true,
-                Some(clauses) => self.evaluate_prepared_where(&record, &schema, clauses)?,
-            };
+        let index_candidates = self.index_candidates_for_where(
+            db_path_str.as_ref(),
+            table_name,
+            &schema,
+            &clause.where_clauses,
+        )?;
+        if let Some(rids) = index_candidates {
+            for rid in rids {
+                let record = self.record_manager.get(table_name, rid)?;
+                let matches = match &prepared_where {
+                    None => true,
+                    Some(clauses) => self.evaluate_prepared_where(&record, &schema, clauses)?,
+                };
 
-            if matches {
-                // Project selected columns
-                let mut row = Vec::new();
-                for &idx in &col_indices {
-                    let value = record.get(idx).unwrap();
-                    row.push(self.format_value(value));
+                if matches {
+                    let mut row = Vec::new();
+                    for &idx in &col_indices {
+                        let value = record.get(idx).unwrap();
+                        row.push(self.format_value(value));
+                    }
+
+                    if let Some(order_idx) = order_by_idx {
+                        let key = record.get(order_idx).unwrap().clone();
+                        order_rows.push((key, row));
+                    } else {
+                        result_rows.push(row);
+                    }
                 }
+            }
+        } else {
+            // Scan table using streaming iterator
+            let scan_iter = self.record_manager.scan_iter(table_name)?;
+            for item in scan_iter {
+                let (_rid, record) = item?;
+                // Evaluate WHERE clause
+                let matches = match &prepared_where {
+                    None => true,
+                    Some(clauses) => self.evaluate_prepared_where(&record, &schema, clauses)?,
+                };
 
-                if let Some(order_idx) = order_by_idx {
-                    let key = record.get(order_idx).unwrap().clone();
-                    order_rows.push((key, row));
-                } else {
-                    result_rows.push(row);
+                if matches {
+                    // Project selected columns
+                    let mut row = Vec::new();
+                    for &idx in &col_indices {
+                        let value = record.get(idx).unwrap();
+                        row.push(self.format_value(value));
+                    }
+
+                    if let Some(order_idx) = order_by_idx {
+                        let key = record.get(order_idx).unwrap().clone();
+                        order_rows.push((key, row));
+                    } else {
+                        result_rows.push(row);
+                    }
                 }
             }
         }
@@ -1145,45 +1221,92 @@ impl DatabaseManager {
             Some(self.prepare_where_clauses(&clause.where_clauses)?)
         };
 
-        let scan_iter = self.record_manager.scan_iter(left_name)?;
         let mut result_rows = Vec::new();
         let mut order_rows = Vec::new();
+        let index_candidates = self.index_candidates_for_where(
+            &self.data_dir.join(db_name).to_string_lossy(),
+            left_name,
+            &left_schema,
+            &clause.where_clauses,
+        )?;
+        if let Some(rids) = index_candidates {
+            for rid in rids {
+                let left_record = self.record_manager.get(left_name, rid)?;
+                for right_record in &right_records {
+                    let matches = match &prepared_where {
+                        None => true,
+                        Some(clauses) => self.evaluate_prepared_join_where(
+                            &left_record,
+                            &left_schema,
+                            left_name,
+                            right_record,
+                            &right_schema,
+                            right_name,
+                            clauses,
+                        )?,
+                    };
 
-        for item in scan_iter {
-            let (_rid, left_record) = item?;
-            for right_record in &right_records {
-                let matches = match &prepared_where {
-                    None => true,
-                    Some(clauses) => self.evaluate_prepared_join_where(
-                        &left_record,
-                        &left_schema,
-                        left_name,
-                        right_record,
-                        &right_schema,
-                        right_name,
-                        clauses,
-                    )?,
-                };
-
-                if matches {
-                    let mut row = Vec::new();
-                    for col_ref in &col_refs {
-                        let value = match col_ref.side {
-                            JoinSide::Left => left_record.get(col_ref.index).unwrap(),
-                            JoinSide::Right => right_record.get(col_ref.index).unwrap(),
-                        };
-                        row.push(self.format_value(value));
-                    }
-
-                    if let Some(order_ref) = &order_by_ref {
-                        let key = match order_ref.side {
-                            JoinSide::Left => left_record.get(order_ref.index).unwrap(),
-                            JoinSide::Right => right_record.get(order_ref.index).unwrap(),
+                    if matches {
+                        let mut row = Vec::new();
+                        for col_ref in &col_refs {
+                            let value = match col_ref.side {
+                                JoinSide::Left => left_record.get(col_ref.index).unwrap(),
+                                JoinSide::Right => right_record.get(col_ref.index).unwrap(),
+                            };
+                            row.push(self.format_value(value));
                         }
-                        .clone();
-                        order_rows.push((key, row));
-                    } else {
-                        result_rows.push(row);
+
+                        if let Some(order_ref) = &order_by_ref {
+                            let key = match order_ref.side {
+                                JoinSide::Left => left_record.get(order_ref.index).unwrap(),
+                                JoinSide::Right => right_record.get(order_ref.index).unwrap(),
+                            }
+                            .clone();
+                            order_rows.push((key, row));
+                        } else {
+                            result_rows.push(row);
+                        }
+                    }
+                }
+            }
+        } else {
+            let scan_iter = self.record_manager.scan_iter(left_name)?;
+            for item in scan_iter {
+                let (_rid, left_record) = item?;
+                for right_record in &right_records {
+                    let matches = match &prepared_where {
+                        None => true,
+                        Some(clauses) => self.evaluate_prepared_join_where(
+                            &left_record,
+                            &left_schema,
+                            left_name,
+                            right_record,
+                            &right_schema,
+                            right_name,
+                            clauses,
+                        )?,
+                    };
+
+                    if matches {
+                        let mut row = Vec::new();
+                        for col_ref in &col_refs {
+                            let value = match col_ref.side {
+                                JoinSide::Left => left_record.get(col_ref.index).unwrap(),
+                                JoinSide::Right => right_record.get(col_ref.index).unwrap(),
+                            };
+                            row.push(self.format_value(value));
+                        }
+
+                        if let Some(order_ref) = &order_by_ref {
+                            let key = match order_ref.side {
+                                JoinSide::Left => left_record.get(order_ref.index).unwrap(),
+                                JoinSide::Right => right_record.get(order_ref.index).unwrap(),
+                            }
+                            .clone();
+                            order_rows.push((key, row));
+                        } else {
+                            result_rows.push(row);
+                        }
                     }
                 }
             }
@@ -1392,6 +1515,106 @@ impl DatabaseManager {
             Some(table) => format!("{}.{}", table, column.column),
             None => column.column.clone(),
         }
+    }
+
+    fn table_column_matches(&self, table_name: &str, column: &TableColumn) -> bool {
+        match &column.table {
+            Some(table) => table == table_name,
+            None => true,
+        }
+    }
+
+    fn index_candidates_for_where(
+        &mut self,
+        db_path: &str,
+        table_name: &str,
+        schema: &TableSchema,
+        where_clauses: &[WhereClause],
+    ) -> DatabaseResult<Option<Vec<RecordId>>> {
+        if !self.use_indexes || where_clauses.is_empty() {
+            return Ok(None);
+        }
+
+        for clause in where_clauses {
+            match clause {
+                WhereClause::Op(col, op, Expression::Value(ParserValue::Integer(value))) => {
+                    if !self.table_column_matches(table_name, col) {
+                        continue;
+                    }
+                    let col_idx = self.resolve_single_column_index(schema, col)?;
+                    if schema.columns[col_idx].data_type != DataType::Int {
+                        continue;
+                    }
+                    match self
+                        .index_manager
+                        .open_index(db_path, table_name, &col.column)
+                    {
+                        Ok(()) => {}
+                        Err(IndexError::IndexNotFound(_)) => continue,
+                        Err(err) => return Err(DatabaseError::IndexError(err)),
+                    }
+
+                    let mut rids = match op {
+                        Operator::Eq => self
+                            .index_manager
+                            .search_all(table_name, &col.column, *value),
+                        Operator::Gt | Operator::Ge | Operator::Lt | Operator::Le => {
+                            let (lower, upper) = match op {
+                                Operator::Gt => (value.saturating_add(1), i64::MAX),
+                                Operator::Ge => (*value, i64::MAX),
+                                Operator::Lt => (i64::MIN, value.saturating_sub(1)),
+                                Operator::Le => (i64::MIN, *value),
+                                _ => (i64::MIN, i64::MAX),
+                            };
+                            self.index_manager
+                                .range_search(table_name, &col.column, lower, upper)
+                                .into_iter()
+                                .map(|(_key, rid)| rid)
+                                .collect()
+                        }
+                        _ => continue,
+                    };
+
+                    rids.sort_by_key(|rid| (rid.page_id, rid.slot_id));
+                    return Ok(Some(rids));
+                }
+                WhereClause::In(col, values) => {
+                    if !self.table_column_matches(table_name, col) {
+                        continue;
+                    }
+                    let col_idx = self.resolve_single_column_index(schema, col)?;
+                    if schema.columns[col_idx].data_type != DataType::Int {
+                        continue;
+                    }
+                    match self
+                        .index_manager
+                        .open_index(db_path, table_name, &col.column)
+                    {
+                        Ok(()) => {}
+                        Err(IndexError::IndexNotFound(_)) => continue,
+                        Err(err) => return Err(DatabaseError::IndexError(err)),
+                    }
+
+                    let mut rids = Vec::new();
+                    for value in values {
+                        if let ParserValue::Integer(int_val) = value {
+                            rids.extend(
+                                self.index_manager
+                                    .search_all(table_name, &col.column, *int_val),
+                            );
+                        }
+                    }
+                    if rids.is_empty() {
+                        return Ok(Some(Vec::new()));
+                    }
+                    rids.sort_by_key(|rid| (rid.page_id, rid.slot_id));
+                    return Ok(Some(rids));
+                }
+                _ => continue,
+            }
+        }
+
+        Ok(None)
     }
 
     fn ensure_numeric_column(&self, schema: &TableSchema, col_idx: usize) -> DatabaseResult<()> {
@@ -2269,7 +2492,8 @@ impl DatabaseManager {
                 continue;
             }
 
-            if fk.column_indices.len() == 1 && fk.ref_column_indices.len() == 1 {
+            if self.use_indexes && fk.column_indices.len() == 1 && fk.ref_column_indices.len() == 1
+            {
                 let fk_value = match values[0] {
                     RecordValue::Int(v) => v as i64,
                     _ => {
@@ -2434,7 +2658,10 @@ impl DatabaseManager {
                 continue;
             }
 
-            if fk.child_column_indices.len() == 1 && fk.parent_column_indices.len() == 1 {
+            if self.use_indexes
+                && fk.child_column_indices.len() == 1
+                && fk.parent_column_indices.len() == 1
+            {
                 let fk_value = match values[0] {
                     RecordValue::Int(v) => v as i64,
                     _ => {
