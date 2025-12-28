@@ -174,6 +174,14 @@ struct IndexDef {
     storage_name: String,
 }
 
+#[derive(Debug, Default)]
+struct ColumnBounds {
+    eq: Option<i64>,
+    lower: Option<i64>,
+    upper: Option<i64>,
+    conflict: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum GroupKey {
     Int(i32),
@@ -2002,52 +2010,121 @@ impl DatabaseManager {
             return Ok(Some(rids));
         }
 
+        let mut single_bounds: HashMap<String, ColumnBounds> = HashMap::new();
+        let mut single_order: Vec<String> = Vec::new();
+        for clause in where_clauses {
+            if let WhereClause::Op(
+                col,
+                op,
+                Expression::Value(ParserValue::Integer(value)),
+            ) = clause
+            {
+                if !self.table_column_matches(table_name, col) {
+                    continue;
+                }
+                if !Self::has_single_column_index(table_meta, &col.column) {
+                    continue;
+                }
+                let col_idx = self.resolve_single_column_index(schema, col)?;
+                if schema.columns[col_idx].data_type != DataType::Int {
+                    continue;
+                }
+
+                let column_name = col.column.clone();
+                if !single_bounds.contains_key(&column_name) {
+                    single_order.push(column_name.clone());
+                }
+                let entry = single_bounds.entry(column_name).or_default();
+                if entry.conflict {
+                    continue;
+                }
+
+                match op {
+                    Operator::Eq => {
+                        if let Some(existing) = entry.eq {
+                            if existing != *value {
+                                entry.conflict = true;
+                            }
+                        } else {
+                            entry.eq = Some(*value);
+                        }
+                    }
+                    Operator::Gt => {
+                        let bound = value.saturating_add(1);
+                        entry.lower = Some(entry.lower.map_or(bound, |v| v.max(bound)));
+                    }
+                    Operator::Ge => {
+                        entry.lower = Some(entry.lower.map_or(*value, |v| v.max(*value)));
+                    }
+                    Operator::Lt => {
+                        let bound = value.saturating_sub(1);
+                        entry.upper = Some(entry.upper.map_or(bound, |v| v.min(bound)));
+                    }
+                    Operator::Le => {
+                        entry.upper = Some(entry.upper.map_or(*value, |v| v.min(*value)));
+                    }
+                    Operator::Ne => {}
+                }
+            }
+        }
+
+        for column in &single_order {
+            let bounds = match single_bounds.get(column) {
+                Some(entry) => entry,
+                None => continue,
+            };
+
+            if bounds.conflict {
+                return Ok(Some(Vec::new()));
+            }
+
+            if !self.ensure_index_open_for_columns(
+                db_path,
+                table_meta,
+                schema,
+                &vec![column.clone()],
+            )? {
+                continue;
+            }
+
+            if let Some(eq) = bounds.eq {
+                if let Some(lower) = bounds.lower {
+                    if eq < lower {
+                        return Ok(Some(Vec::new()));
+                    }
+                }
+                if let Some(upper) = bounds.upper {
+                    if eq > upper {
+                        return Ok(Some(Vec::new()));
+                    }
+                }
+                let mut rids = self.index_manager.search_all(table_name, column, eq);
+                rids.sort_by_key(|rid| (rid.page_id, rid.slot_id));
+                return Ok(Some(rids));
+            }
+
+            if bounds.lower.is_none() && bounds.upper.is_none() {
+                continue;
+            }
+
+            let lower = bounds.lower.unwrap_or(i64::MIN);
+            let upper = bounds.upper.unwrap_or(i64::MAX);
+            if lower > upper {
+                return Ok(Some(Vec::new()));
+            }
+
+            let mut rids = self
+                .index_manager
+                .range_search(table_name, column, lower, upper)
+                .into_iter()
+                .map(|(_key, rid)| rid)
+                .collect::<Vec<_>>();
+            rids.sort_by_key(|rid| (rid.page_id, rid.slot_id));
+            return Ok(Some(rids));
+        }
+
         for clause in where_clauses {
             match clause {
-                WhereClause::Op(col, op, Expression::Value(ParserValue::Integer(value))) => {
-                    if !self.table_column_matches(table_name, col) {
-                        continue;
-                    }
-                    if !Self::has_single_column_index(table_meta, &col.column) {
-                        continue;
-                    }
-                    let col_idx = self.resolve_single_column_index(schema, col)?;
-                    if schema.columns[col_idx].data_type != DataType::Int {
-                        continue;
-                    }
-                    if !self.ensure_index_open_for_columns(
-                        db_path,
-                        table_meta,
-                        schema,
-                        &vec![col.column.clone()],
-                    )? {
-                        continue;
-                    }
-
-                    let mut rids = match op {
-                        Operator::Eq => self
-                            .index_manager
-                            .search_all(table_name, &col.column, *value),
-                        Operator::Gt | Operator::Ge | Operator::Lt | Operator::Le => {
-                            let (lower, upper) = match op {
-                                Operator::Gt => (value.saturating_add(1), i64::MAX),
-                                Operator::Ge => (*value, i64::MAX),
-                                Operator::Lt => (i64::MIN, value.saturating_sub(1)),
-                                Operator::Le => (i64::MIN, *value),
-                                _ => (i64::MIN, i64::MAX),
-                            };
-                            self.index_manager
-                                .range_search(table_name, &col.column, lower, upper)
-                                .into_iter()
-                                .map(|(_key, rid)| rid)
-                                .collect()
-                        }
-                        _ => continue,
-                    };
-
-                    rids.sort_by_key(|rid| (rid.page_id, rid.slot_id));
-                    return Ok(Some(rids));
-                }
                 WhereClause::In(col, values) => {
                     if !self.table_column_matches(table_name, col) {
                         continue;
@@ -3113,8 +3190,11 @@ impl DatabaseManager {
                     Err(err) => return Err(DatabaseError::IndexError(err)),
                 };
 
-                if used_index && index_found {
-                    continue;
+                if used_index {
+                    if index_found {
+                        continue;
+                    }
+                    return Err(self.foreign_key_error(fk, &values));
                 }
             }
             if self.use_indexes && fk.column_indices.len() == 2 && fk.ref_column_indices.len() == 2
@@ -3154,8 +3234,11 @@ impl DatabaseManager {
                     Err(err) => return Err(DatabaseError::IndexError(err)),
                 };
 
-                if used_index && index_found {
-                    continue;
+                if used_index {
+                    if index_found {
+                        continue;
+                    }
+                    return Err(self.foreign_key_error(fk, &values));
                 }
             }
 
@@ -3322,8 +3405,11 @@ impl DatabaseManager {
                     Err(err) => return Err(DatabaseError::IndexError(err)),
                 };
 
-                if used_index && index_found {
-                    return Err(self.foreign_key_delete_error(fk, &values));
+                if used_index {
+                    if index_found {
+                        return Err(self.foreign_key_delete_error(fk, &values));
+                    }
+                    continue;
                 }
             }
             if self.use_indexes
@@ -3366,8 +3452,11 @@ impl DatabaseManager {
                     Err(err) => return Err(DatabaseError::IndexError(err)),
                 };
 
-                if used_index && index_found {
-                    return Err(self.foreign_key_delete_error(fk, &values));
+                if used_index {
+                    if index_found {
+                        return Err(self.foreign_key_delete_error(fk, &values));
+                    }
+                    continue;
                 }
             }
 
