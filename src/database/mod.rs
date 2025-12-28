@@ -1710,6 +1710,18 @@ impl DatabaseManager {
         }
     }
 
+    fn has_single_column_index(table_meta: &TableMetadata, column: &str) -> bool {
+        if let Some(pk_cols) = &table_meta.primary_key {
+            if pk_cols.len() == 1 && pk_cols[0] == column {
+                return true;
+            }
+        }
+        table_meta
+            .indexes
+            .iter()
+            .any(|idx| idx.columns.len() == 1 && idx.columns[0] == column)
+    }
+
     fn build_index_defs(&self, table_meta: &TableMetadata) -> DatabaseResult<Vec<IndexDef>> {
         let mut defs = Vec::new();
         let mut seen = HashSet::new();
@@ -1996,6 +2008,9 @@ impl DatabaseManager {
                     if !self.table_column_matches(table_name, col) {
                         continue;
                     }
+                    if !Self::has_single_column_index(table_meta, &col.column) {
+                        continue;
+                    }
                     let col_idx = self.resolve_single_column_index(schema, col)?;
                     if schema.columns[col_idx].data_type != DataType::Int {
                         continue;
@@ -2035,6 +2050,9 @@ impl DatabaseManager {
                 }
                 WhereClause::In(col, values) => {
                     if !self.table_column_matches(table_name, col) {
+                        continue;
+                    }
+                    if !Self::has_single_column_index(table_meta, &col.column) {
                         continue;
                     }
                     let col_idx = self.resolve_single_column_index(schema, col)?;
@@ -2542,11 +2560,7 @@ impl DatabaseManager {
 
         // Step 5: Reconstruct all indexes using bulk create
         for def in &index_defs {
-            let table_file = {
-                let mut buffer_manager = self.buffer_manager.lock().unwrap();
-                TableFile::open(&mut buffer_manager, &table_path_str, schema.clone())?
-            };
-            let scan_iter = table_file.scan_iter(self.buffer_manager.clone());
+            let scan_iter = self.record_manager.scan_iter(table)?;
 
             match def.indices.as_slice() {
                 [col_idx] => {

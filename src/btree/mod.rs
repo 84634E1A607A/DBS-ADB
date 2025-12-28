@@ -438,7 +438,6 @@ impl BPlusTree {
                 .get_node_mut(leaf_id)
                 .and_then(|n| n.as_leaf_mut())
                 .ok_or(BPlusTreeError::NodeNotFound(leaf_id))?;
-            right.next = leaf.next.take();
             leaf.next = Some(right_id);
 
             // Store the right leaf
@@ -1683,6 +1682,26 @@ mod tests {
         // Reversed range
         let results = tree.range_search(50, 20);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_split_preserves_leaf_chain() {
+        let mut tree = BPlusTree::new(4).unwrap();
+
+        let keys = [10, 20, 30, 40, 50, 60, 35, 37];
+        for (i, key) in keys.iter().enumerate() {
+            tree.insert(*key, rid(1, i)).unwrap();
+        }
+
+        // This triggers a split on a leaf that already has a next pointer.
+        // The leaf chain should still reach the largest keys.
+        let results = tree.range_search(0, 100);
+        let result_keys: Vec<i64> = results.iter().map(|(key, _)| *key).collect();
+
+        assert_eq!(result_keys.len(), keys.len());
+        assert!(result_keys.contains(&50));
+        assert!(result_keys.contains(&60));
+        validate_btree_structure(&tree).unwrap();
     }
 
     #[test]
