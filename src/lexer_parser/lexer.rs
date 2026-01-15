@@ -74,11 +74,19 @@ pub fn lexer<'a>() -> impl Parser<'a, &'a str, Vec<SQLToken<'a>>, extra::Err<Ric
         .ignored();
 
     let number = regex(r"-?\d+\.\d*")
-        .map(|s: &str| SQLToken::Float(s.parse().unwrap()))
+        .try_map(|s: &str, span| {
+            s.parse::<f64>()
+                .map(|val| SQLToken::Float(val))
+                .map_err(|err| Rich::custom(span, err.to_string()))
+        })
         .padded();
 
     let integer = regex(r"-?\d+")
-        .map(|s: &str| SQLToken::Integer(s.parse().unwrap()))
+        .try_map(|s: &str, span| {
+            s.parse::<i64>()
+                .map(|val| SQLToken::Integer(val))
+                .map_err(|err| Rich::custom(span, err.to_string()))
+        })
         .padded();
 
     let string = regex(r#"'([^'\\]|\\.)*'"#)

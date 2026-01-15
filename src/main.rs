@@ -2,8 +2,14 @@ use adb::database::{DatabaseError, DatabaseManager, QueryResult};
 use adb::lexer_parser::{self, Query};
 use clap::Parser;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::Path;
+use std::time::Instant;
+
+use prettytable::{Cell, Row, Table};
+use rustyline::error::ReadlineError;
+use rustyline::history::DefaultHistory;
+use rustyline::Editor;
 
 #[derive(Parser, Debug)]
 #[command(name = "adb")]
@@ -87,7 +93,9 @@ fn main() {
     // If database is specified, execute USE command
     if let Some(db_name) = args.database {
         let use_query = format!("USE {};", db_name);
-        if let Err(e) = execute_sql_line(&mut db_manager, &use_query, args.batch) {
+        if let Err(e) =
+            execute_sql_line(&mut db_manager, &use_query, output_mode_from_batch(args.batch))
+        {
             eprintln!("Failed to use database {}: {}", db_name, e);
             std::process::exit(1);
         }
@@ -104,7 +112,11 @@ fn main() {
     }
 
     // Interactive or batch mode
-    run_interactive_mode(&mut db_manager, args.batch);
+    if !args.batch && io::stdin().is_terminal() {
+        run_interactive_repl(&mut db_manager);
+    } else {
+        run_stdin_mode(&mut db_manager, args.batch);
+    }
 }
 
 fn import_data_from_file(
@@ -125,7 +137,7 @@ fn import_data_from_file(
         }
 
         // Parse and execute the SQL statement
-        if let Err(e) = execute_sql_line(db_manager, line, batch_mode) {
+        if let Err(e) = execute_sql_line(db_manager, line, output_mode_from_batch(batch_mode)) {
             return Err(format!("Error executing '{}': {}", line, e));
         }
     }
@@ -133,27 +145,42 @@ fn import_data_from_file(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum OutputMode {
+    Batch,
+    NonBatchPipe,
+    Interactive,
+}
+
+fn output_mode_from_batch(batch_mode: bool) -> OutputMode {
+    if batch_mode {
+        OutputMode::Batch
+    } else {
+        OutputMode::NonBatchPipe
+    }
+}
+
 fn execute_sql_line(
     db_manager: &mut DatabaseManager,
     line: &str,
-    batch_mode: bool,
+    output_mode: OutputMode,
 ) -> Result<(), String> {
     let queries = lexer_parser::parse(line).map_err(|e| format!("Parse error: {}", e))?;
 
     for query in queries {
-        if !batch_mode {
+        if matches!(output_mode, OutputMode::NonBatchPipe) {
             print_query_echo(line);
         }
 
         let result = execute_query(db_manager, query).map_err(|e| format!("{}", e))?;
 
-        print_result(&result);
+        print_result(&result, output_mode);
     }
 
     Ok(())
 }
 
-fn run_interactive_mode(db_manager: &mut DatabaseManager, batch_mode: bool) {
+fn run_stdin_mode(db_manager: &mut DatabaseManager, batch_mode: bool) {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -195,7 +222,7 @@ fn run_interactive_mode(db_manager: &mut DatabaseManager, batch_mode: bool) {
 
             let result = execute_query(db_manager, query);
             match result {
-                Ok(res) => print_result(&res),
+                Ok(res) => print_result(&res, output_mode_from_batch(batch_mode)),
                 Err(e) => {
                     if batch_mode {
                         println!("!ERROR");
@@ -220,6 +247,116 @@ fn run_interactive_mode(db_manager: &mut DatabaseManager, batch_mode: bool) {
     }
 }
 
+fn run_interactive_repl(db_manager: &mut DatabaseManager) {
+    let mut rl = match Editor::<(), DefaultHistory>::new() {
+        Ok(editor) => editor,
+        Err(e) => {
+            eprintln!("Failed to initialize editor: {}", e);
+            return;
+        }
+    };
+
+    loop {
+        let Some(statement) = read_statement(&mut rl) else {
+            break;
+        };
+
+        let start = Instant::now();
+        match execute_sql_line(db_manager, &statement, OutputMode::Interactive) {
+            Ok(()) => {
+                let elapsed = start.elapsed();
+                println!("Time: {:.3} ms", elapsed.as_secs_f64() * 1000.0);
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+            }
+        }
+    }
+}
+
+fn read_statement(rl: &mut Editor<(), DefaultHistory>) -> Option<String> {
+    let mut buffer = String::new();
+    let mut prompt = "adb> ";
+
+    loop {
+        match rl.readline(prompt) {
+            Ok(line) => {
+                let trimmed = line.trim_end();
+                if buffer.is_empty() && trimmed.eq_ignore_ascii_case("exit") {
+                    return None;
+                }
+                if !trimmed.is_empty() {
+                    let _ = rl.add_history_entry(trimmed);
+                }
+
+                buffer.push_str(trimmed);
+                buffer.push('\n');
+
+                if statement_complete(&buffer) {
+                    return Some(buffer);
+                }
+
+                prompt = "...> ";
+            }
+            Err(ReadlineError::Interrupted) => {
+                println!("^C");
+                buffer.clear();
+                prompt = "adb> ";
+            }
+            Err(ReadlineError::Eof) => return None,
+            Err(err) => {
+                eprintln!("Read error: {}", err);
+                return None;
+            }
+        }
+    }
+}
+
+fn statement_complete(input: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut in_line_comment = false;
+    let mut last_non_ws = None;
+    let mut iter = input.chars().peekable();
+
+    while let Some(ch) = iter.next() {
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+
+        if !in_single && !in_double && ch == '-' {
+            if matches!(iter.peek(), Some('-')) {
+                iter.next();
+                in_line_comment = true;
+                continue;
+            }
+        }
+
+        if ch == '\\' && !escaped {
+            escaped = true;
+            continue;
+        }
+
+        if ch == '\'' && !in_double && !escaped {
+            in_single = !in_single;
+        } else if ch == '"' && !in_single && !escaped {
+            in_double = !in_double;
+        }
+
+        escaped = false;
+
+        if !ch.is_whitespace() {
+            last_non_ws = Some(ch);
+        }
+    }
+
+    !in_single && !in_double && last_non_ws == Some(';')
+}
+
 fn print_query_echo(_original: &str) {
     // Print original query as comment
     println!("@{}", _original);
@@ -237,20 +374,22 @@ fn execute_query(
     }
 }
 
-fn print_result(result: &QueryResult) {
+fn print_result(result: &QueryResult, output_mode: OutputMode) {
+    match output_mode {
+        OutputMode::Interactive => print_result_interactive(result),
+        OutputMode::Batch | OutputMode::NonBatchPipe => print_result_legacy(result),
+    }
+}
+
+fn print_result_legacy(result: &QueryResult) {
     match result {
-        QueryResult::Empty => {
-            // No output for empty results
-        }
+        QueryResult::Empty => {}
         QueryResult::RowsAffected(count) => {
             println!("rows");
             println!("{}", count);
         }
         QueryResult::ResultSet(headers, rows) => {
-            // Print headers
             println!("{}", headers.join(","));
-
-            // Print rows
             for row in rows {
                 println!("{}", row.join(","));
             }
@@ -271,7 +410,6 @@ fn print_result(result: &QueryResult) {
                 );
             }
 
-            // Blank line to separate column definitions from constraints
             println!();
 
             if let Some(pk) = &meta.primary_key {
@@ -291,7 +429,74 @@ fn print_result(result: &QueryResult) {
                 if idx.implicit {
                     continue;
                 }
-                // Index name is omitted in expected outputs
+                println!("INDEX ({});", idx.columns.join(", "));
+            }
+        }
+    }
+}
+
+fn print_result_interactive(result: &QueryResult) {
+    match result {
+        QueryResult::Empty => {}
+        QueryResult::RowsAffected(count) => {
+            println!("{} rows affected", count);
+        }
+        QueryResult::ResultSet(headers, rows) => {
+            let mut table = Table::new();
+            let header_cells = headers.iter().map(|h| Cell::new(h)).collect();
+            table.add_row(Row::new(header_cells));
+
+            for row in rows {
+                let cells = row.iter().map(|v| Cell::new(v)).collect();
+                table.add_row(Row::new(cells));
+            }
+
+            table.printstd();
+        }
+        QueryResult::List(items) => {
+            for item in items {
+                println!("{}", item);
+            }
+        }
+        QueryResult::TableDescription(meta) => {
+            let mut table = Table::new();
+            table.add_row(Row::new(vec![
+                Cell::new("Field"),
+                Cell::new("Type"),
+                Cell::new("Null"),
+                Cell::new("Default"),
+            ]));
+
+            for col in &meta.columns {
+                let null_str = if col.not_null { "NO" } else { "YES" };
+                let default_str = col.default_value.as_deref().unwrap_or("NULL");
+                table.add_row(Row::new(vec![
+                    Cell::new(&col.name),
+                    Cell::new(&col.column_type),
+                    Cell::new(null_str),
+                    Cell::new(default_str),
+                ]));
+            }
+
+            table.printstd();
+
+            if let Some(pk) = &meta.primary_key {
+                println!("PRIMARY KEY ({});", pk.join(", "));
+            }
+
+            for fk in &meta.foreign_keys {
+                println!(
+                    "FOREIGN KEY ({}) REFERENCES {}({});",
+                    fk.columns.join(", "),
+                    fk.ref_table,
+                    fk.ref_columns.join(", ")
+                );
+            }
+
+            for idx in &meta.indexes {
+                if idx.implicit {
+                    continue;
+                }
                 println!("INDEX ({});", idx.columns.join(", "));
             }
         }

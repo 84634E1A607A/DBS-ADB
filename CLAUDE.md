@@ -6,7 +6,7 @@ The codebase is written in Rust in `.` directory. Before importing any external 
 
 Your testcases are located in `../dbs-testcase/` folder, check `../dbs-testcase/README.md` for instructions on how to run the testcases against your implementation. Your implementation is good, as long as it can pass relevant testcases.
 
-Run `cd /home/ajax/source/db/dbs-testcase && python3 runner.py -f query data pk index -- /home/ajax/source/db/adb/target/release/adb` and make sure you pass the cases.
+Run `python3 runner.py -f query join pk index data fk comb aggregate order fuzzy -- /home/ajax/source/db/adb/target/release/adb` and make sure you pass the cases.
 
 To debug, use `echo "QUERY HERE; CAN BE MULTIPLE;" | /home/ajax/source/db/adb/target/release/adb` to run single-line queries efficiently.
 

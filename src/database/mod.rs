@@ -565,7 +565,7 @@ impl DatabaseManager {
                     return Err(DatabaseError::NotNullViolation(col.name.clone()));
                 }
 
-                record_values.push(self.parser_value_to_record_value(value, &col.to_data_type()));
+                record_values.push(self.parser_value_to_record_value(value, &col.to_data_type())?);
             }
 
             let record = Record::new(record_values);
@@ -997,7 +997,7 @@ impl DatabaseManager {
             // Apply updates
             for (col_idx, new_value) in &update_map {
                 let data_type = &schema.columns[*col_idx].data_type;
-                let record_value = self.parser_value_to_record_value(new_value, data_type);
+                let record_value = self.parser_value_to_record_value(new_value, data_type)?;
                 record.set(*col_idx, record_value);
             }
 
@@ -3508,13 +3508,52 @@ impl DatabaseManager {
     fn parser_value_to_record_value(
         &self,
         value: &ParserValue,
-        _data_type: &crate::record::DataType,
-    ) -> RecordValue {
-        match value {
-            ParserValue::Null => RecordValue::Null,
-            ParserValue::Integer(i) => RecordValue::Int(*i as i32),
-            ParserValue::Float(f) => RecordValue::Float(*f),
-            ParserValue::String(s) => RecordValue::String(s.clone()),
+        data_type: &crate::record::DataType,
+    ) -> DatabaseResult<RecordValue> {
+        match (value, data_type) {
+            (ParserValue::Null, _) => Ok(RecordValue::Null),
+            (ParserValue::Integer(i), DataType::Int) => Ok(RecordValue::Int(*i as i32)),
+            (ParserValue::Integer(_), DataType::Float) => {
+                Err(DatabaseError::TypeMismatch(format!(
+                    "Cannot compare integer value with float column"
+                )))
+            }
+            (ParserValue::Integer(_), DataType::Char(_)) => {
+                Err(DatabaseError::TypeMismatch(format!(
+                    "Cannot compare integer value with string column"
+                )))
+            }
+            (ParserValue::Float(f), DataType::Float) => Ok(RecordValue::Float(*f)),
+            (ParserValue::Float(_), DataType::Int) => {
+                Err(DatabaseError::TypeMismatch(format!(
+                    "Cannot compare float value with integer column"
+                )))
+            }
+            (ParserValue::Float(_), DataType::Char(_)) => {
+                Err(DatabaseError::TypeMismatch(format!(
+                    "Cannot compare float value with string column"
+                )))
+            }
+            (ParserValue::String(s), DataType::Char(max_len)) => {
+                if s.len() > *max_len {
+                    return Err(DatabaseError::TypeMismatch(format!(
+                        "String value too long for column: {} > {}",
+                        s.len(),
+                        max_len
+                    )));
+                }
+                Ok(RecordValue::String(s.clone()))
+            }
+            (ParserValue::String(_), DataType::Int) => {
+                Err(DatabaseError::TypeMismatch(format!(
+                    "Cannot compare string value with integer column"
+                )))
+            }
+            (ParserValue::String(_), DataType::Float) => {
+                Err(DatabaseError::TypeMismatch(format!(
+                    "Cannot compare string value with float column"
+                )))
+            }
         }
     }
 
@@ -3679,7 +3718,7 @@ impl DatabaseManager {
                     let right_val = match expr {
                         Expression::Value(v) => {
                             let data_type = &schema.columns[col_idx].data_type;
-                            self.parser_value_to_record_value(v, data_type)
+                            self.parser_value_to_record_value(v, data_type)?
                         }
                         Expression::Column(_) => {
                             return Err(DatabaseError::TypeMismatch(
@@ -3768,7 +3807,7 @@ impl DatabaseManager {
                     )?;
 
                     let right_val = match expr {
-                        Expression::Value(v) => self.parser_value_to_record_value(v, data_type),
+                        Expression::Value(v) => self.parser_value_to_record_value(v, data_type)?,
                         Expression::Column(tc) => {
                             let (value, _) = self.join_value_and_type(
                                 tc,
