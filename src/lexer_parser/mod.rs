@@ -1,7 +1,8 @@
 mod lexer;
 mod parser;
 
-use lexer::{KeywordEnum, SQLToken, lexer};
+pub use lexer::{KeywordEnum, SQLToken};
+use lexer::{lexer, lexer_with_keyword_case};
 pub use parser::{
     AlterStatement, ColumnType, CreateTableField, DBStatement, Expression, Operator, Query,
     SelectClause, Selector, Selectors, TableColumn, TableStatement, Value, WhereClause, parser,
@@ -10,8 +11,19 @@ pub use parser::{
 use chumsky::Parser;
 
 pub fn parse(input: &str) -> Result<Vec<Query>, String> {
+    parse_with_keyword_case(input, false)
+}
+
+pub fn parse_case_insensitive(input: &str) -> Result<Vec<Query>, String> {
+    parse_with_keyword_case(input, true)
+}
+
+fn parse_with_keyword_case(input: &str, case_insensitive: bool) -> Result<Vec<Query>, String> {
     // Run lexer
-    let tokens = match lexer().parse(input).into_result() {
+    let tokens = match lexer_with_keyword_case(case_insensitive)
+        .parse(input)
+        .into_result()
+    {
         Ok(t) => t,
         Err(errs) => {
             return Err(format!("Lexer errors: {:?}", errs));

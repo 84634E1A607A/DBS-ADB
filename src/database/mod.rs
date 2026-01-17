@@ -71,6 +71,9 @@ pub enum DatabaseError {
 
     #[error("Not null constraint violation for column {0}")]
     NotNullViolation(String),
+
+    #[error("Column {0} specified more than once")]
+    DuplicateColumn(String),
 }
 
 pub type DatabaseResult<T> = Result<T, DatabaseError>;
@@ -387,10 +390,15 @@ impl DatabaseManager {
         let mut columns = Vec::new();
         let mut primary_key = None;
         let mut foreign_keys = Vec::new();
+        let mut seen_columns = HashSet::new();
 
         for field in fields {
             match field {
                 CreateTableField::Col(col_name, col_type, not_null, default) => {
+                    // Check for duplicate column names
+                    if !seen_columns.insert(col_name.clone()) {
+                        return Err(DatabaseError::DuplicateColumn(col_name));
+                    }
                     columns.push(ColumnMetadata::from_parser(
                         col_name, col_type, not_null, default,
                     ));

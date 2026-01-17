@@ -165,7 +165,12 @@ fn execute_sql_line(
     line: &str,
     output_mode: OutputMode,
 ) -> Result<(), String> {
-    let queries = lexer_parser::parse(line).map_err(|e| format!("Parse error: {}", e))?;
+    let queries = if matches!(output_mode, OutputMode::Interactive) {
+        lexer_parser::parse_case_insensitive(line)
+    } else {
+        lexer_parser::parse(line)
+    }
+    .map_err(|e| format!("Parse error: {}", e))?;
 
     for query in queries {
         if matches!(output_mode, OutputMode::NonBatchPipe) {
